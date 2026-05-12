@@ -288,6 +288,214 @@ app.post("/webhook/jelou", (req, res) => {
   res.sendStatus(200);
 });
 
+
+// ════════════════════════════════════════════════════════════
+//  6. TALENT SCANNER — Búsqueda y match de candidatos
+// ════════════════════════════════════════════════════════════
+
+// POST /talent/search
+// Body: { cargo, experiencia, skills, ubicacion, scoreMin, limit }
+app.post("/talent/search", async (req, res, next) => {
+  try {
+    const { cargo, experiencia = "2+", skills = [], ubicacion = "Colombia", scoreMin = 70, limit = 10 } = req.body;
+
+    const skillsStr = Array.isArray(skills) ? skills.join(", ") : skills;
+    const queries = [
+      `site:linkedin.com/in "${cargo}" "${ubicacion}" open to work`,
+      `site:computrabajo.com.co "${cargo}" ${skillsStr}`,
+      `site:elempleo.com "${cargo}" "${ubicacion}"`,
+      `"${cargo}" "${ubicacion}" hoja de vida ${skillsStr}`,
+    ];
+
+    const allResults = [];
+
+    for (const query of queries.slice(0, 2)) {
+      try {
+        const fcRes = await fetch("https://api.firecrawl.dev/v1/search", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${process.env.FIRECRAWL_API_KEY}`,
+          },
+          body: JSON.stringify({
+            query,
+            limit: Math.ceil(limit / 2),
+            lang: "es",
+            country: "co",
+            scrapeOptions: { formats: ["markdown"] },
+          }),
+        });
+        const data = await fcRes.json();
+        if (data.data) allResults.push(...data.data);
+      } catch (e) {
+        console.error("[TALENT SEARCH]", e.message);
+      }
+    }
+
+    // Claude evalúa cada candidato
+    const scored = await Promise.all(
+      allResults.slice(0, limit).map(async (item) => {
+        const prompt = `Analiza este perfil de candidato y devuelve SOLO JSON:
+{
+  "nombre": "...",
+  "cargo_actual": "...",
+  "empresa_actual": "...",
+  "ubicacion": "...",
+  "telefono": "... o null",
+  "email": "... o null",
+  "anos_experiencia": 5,
+  "skills_detectados": ["skill1", "skill2"],
+  "score": 85,
+  "resumen": "2 oraciones del perfil profesional",
+  "senal_apertura": "por qué parece abierto a oportunidades"
+}
+
+Cargo buscado: ${cargo} | Experiencia requerida: ${experiencia} años | Skills: ${skillsStr} | Ubicación: ${ubicacion}
+Perfil: ${item.markdown?.slice(0, 1000) || item.description || item.title || ""}`;
+
+        try {
+          const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-api-key": process.env.ANTHROPIC_API_KEY,
+              "anthropic-version": "2023-06-01",
+            },
+            body: JSON.stringify({
+              model: "claude-haiku-4-5-20251001",
+              max_tokens: 400,
+              messages: [{ role: "user", content: prompt }],
+            }),
+          });
+          const aiData = await aiRes.json();
+          const text = aiData.content?.[0]?.text || "{}";
+          const candidate = JSON.parse(text.replace(/```json|```/g, "").trim());
+          return { ...candidate, url: item.url, fuente: new URL(item.url).hostname };
+        } catch {
+          return { nombre: item.title, url: item.url, score: 50, fuente: "web" };
+        }
+      })
+    );
+
+    const filtered = scored.filter(c => (c.score || 0) >= scoreMin);
+    res.json({ candidates: filtered, total: filtered.length, cargo, ubicacion });
+  } catch (err) { next(err); }
+});
+
+// POST /talent/match
+// Body: { candidate, requirements }
+// requirements: { cargo, skills_requeridos, skills_deseados, experiencia, descripcion }
+app.post("/talent/match", async (req, res, next) => {
+  try {
+    const { candidate, requirements } = req.body;
+
+    const prompt = `Eres un experto en selección de talento. Analiza el match entre este candidato y los requisitos del cargo.
+
+CANDIDATO:
+${JSON.stringify(candidate, null, 2)}
+
+REQUISITOS DEL CARGO:
+${JSON.stringify(requirements, null, 2)}
+
+Devuelve SOLO JSON con este formato exacto:
+{
+  "score": 84,
+  "nivel": "Alto",
+  "tiene": ["skill o experiencia que sí tiene", "..."],
+  "falta": ["skill o experiencia que le falta", "..."],
+  "destacados": ["punto más fuerte del candidato", "..."],
+  "brechas_criticas": ["brecha que podría descartar al candidato o null"],
+  "recomendacion": "Vale la pena contactar — la brecha X es entrenable en 3 meses",
+  "mensaje_personalizado": "Mensaje de WhatsApp de 120 caracteres máximo explicándole al candidato por qué hace match con el cargo y qué le falta"
+}`;
+
+    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 600,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+
+    const data = await aiRes.json();
+    const text = data.content?.[0]?.text || "{}";
+    const match = JSON.parse(text.replace(/```json|```/g, "").trim());
+    res.json({ ...match, candidate: candidate.nombre, cargo: requirements.cargo });
+  } catch (err) { next(err); }
+});
+
+// POST /talent/contact
+// Body: { phone, candidateName, cargo, matchScore, tiene, falta, mensaje }
+app.post("/talent/contact", async (req, res, next) => {
+  try {
+    const { phone, candidateName, cargo, matchScore, tiene = [], falta = [], mensaje } = req.body;
+    if (!phone) return res.status(400).json({ error: "phone requerido" });
+
+    const token = await getJelouToken();
+
+    // Construir mensaje personalizado
+    const msg = mensaje || 
+      `Hola ${candidateName}, tu perfil hace ${matchScore}% match con una posición de ${cargo}. ` +
+      `Tienes: ${tiene.slice(0,2).join(", ")}. ` +
+      (falta.length > 0 ? `Brecha menor: ${falta[0]}. ` : "") +
+      `¿Te interesa saber más?`;
+
+    const jelouRes = await fetch(
+      `https://api.jelou.ai/v1/bots/${process.env.JELOU_BOT_ID}/users/${phone}/messages`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({ type: "TEXT", text: msg }),
+      }
+    );
+
+    const jelouData = await jelouRes.json();
+    res.json({ ok: true, messageId: jelouData.id, candidate: candidateName, mensaje: msg });
+  } catch (err) { next(err); }
+});
+
+// GET /talent/pipeline
+// Lista candidatos en el pipeline de talento
+const talentPipeline = {
+  nuevo:         [],
+  contactado:    [],
+  respondio:     [],
+  entrevista:    [],
+  seleccionado:  [],
+};
+
+app.get("/talent/pipeline", (_req, res) => res.json(talentPipeline));
+
+app.post("/talent/pipeline/add", (req, res) => {
+  const candidate = { ...req.body, id: Date.now().toString(), created_at: new Date().toISOString() };
+  talentPipeline.nuevo.push(candidate);
+  res.status(201).json(candidate);
+});
+
+app.patch("/talent/pipeline/:id/move", (req, res) => {
+  const { id } = req.params;
+  const { to }  = req.body;
+  for (const stage of Object.keys(talentPipeline)) {
+    const idx = talentPipeline[stage].findIndex(c => c.id === id);
+    if (idx !== -1) {
+      const [candidate] = talentPipeline[stage].splice(idx, 1);
+      if (!talentPipeline[to]) talentPipeline[to] = [];
+      talentPipeline[to].push({ ...candidate, stage: to });
+      return res.json({ ok: true, candidate: { ...candidate, stage: to } });
+    }
+  }
+  res.status(404).json({ error: "Candidato no encontrado" });
+});
+
 // ── Error handler ────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error("[ERROR]", err.message);
