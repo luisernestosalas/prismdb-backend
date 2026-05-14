@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════
 //  PrismDB — Backend Node.js
-//  Integraciones: Firecrawl · Jelou · Anthropic · MercadoPago
+//  Integraciones: Firecrawl · Twilio WhatsApp · Anthropic · MercadoPago
 // ═══════════════════════════════════════════════════════════
 
 import express from "express";
@@ -21,6 +21,24 @@ app.use(express.json({ limit: "2mb" }));
 app.get("/health", (_req, res) => res.json({ ok: true, app: "prismdb", ts: Date.now() }));
 
 // ════════════════════════════════════════════════════════════
+//  TWILIO — WhatsApp
+// ════════════════════════════════════════════════════════════
+const TWILIO_SID   = process.env.TWILIO_ACCOUNT_SID  || 'AC9171340052e334043fe1805126b2ca60';
+const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN    || '3632808f81f739c76a0287ce31e00df9';
+const TWILIO_FROM  = process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886';
+
+async function sendWhatsApp(to, message) {
+  const phone = to.startsWith('whatsapp:') ? to : `whatsapp:+57${to.replace(/\D/g,'')}`;
+  const credentials = Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString('base64');
+  const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`, {
+    method: 'POST',
+    headers: { 'Authorization': `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ From: TWILIO_FROM, To: phone, Body: message }),
+  });
+  return await res.json();
+}
+
+// ════════════════════════════════════════════════════════════
 //  1. PROSPECCIÓN — Buscar leads con Firecrawl + scoring Claude
 // ════════════════════════════════════════════════════════════
 app.post("/leads/search", async (req, res, next) => {
@@ -34,8 +52,7 @@ app.post("/leads/search", async (req, res, next) => {
       body: JSON.stringify({ query: searchQuery, limit, lang: "es", country: "co", scrapeOptions: { formats: ["markdown"] } }),
     });
 
-    const fcData = await fcRes.json();
-    const results = fcData.data || [];
+    const results = (await fcRes.json()).data || [];
 
     const scoredLeads = await Promise.all(
       results.map(async (item) => {
@@ -44,12 +61,11 @@ app.post("/leads/search", async (req, res, next) => {
 Perfil: ${item.markdown?.slice(0, 800) || item.description || item.title}
 Criterios: cargo=${cargo}, sector=${sector}, ciudad=${ciudad}`;
         try {
-          const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+          const aiData = await (await fetch("https://api.anthropic.com/v1/messages", {
             method: "POST",
             headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
             body: JSON.stringify({ model: "claude-haiku-4-5-20251001", max_tokens: 300, messages: [{ role: "user", content: prompt }] }),
-          });
-          const aiData = await aiRes.json();
+          })).json();
           const lead = JSON.parse(aiData.content?.[0]?.text?.replace(/```json|```/g, "").trim() || "{}");
           return { ...lead, url: item.url, source: "firecrawl" };
         } catch { return { nombre: item.title, url: item.url, score: 50, source: "firecrawl" }; }
@@ -61,49 +77,49 @@ Criterios: cargo=${cargo}, sector=${sector}, ciudad=${ciudad}`;
 });
 
 // ════════════════════════════════════════════════════════════
-//  2. MENSAJERÍA — WhatsApp via Jelou
+//  2. MENSAJERÍA — WhatsApp via Twilio
 // ════════════════════════════════════════════════════════════
-async function getJelouToken() {
-  const res = await fetch("https://api.jelou.ai/v1/auth/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ client_id: process.env.JELOU_CLIENT_ID, client_secret: process.env.JELOU_CLIENT_SECRET, grant_type: "client_credentials" }),
-  });
-  return (await res.json()).access_token;
-}
 
+// POST /messages/send
 app.post("/messages/send", async (req, res, next) => {
   try {
     const { phone, message, leadName = "" } = req.body;
     if (!phone || !message) return res.status(400).json({ error: "phone y message requeridos" });
-    const token = await getJelouToken();
-    const data = await (await fetch(`https://api.jelou.ai/v1/bots/${process.env.JELOU_BOT_ID}/users/${phone}/messages`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
-      body: JSON.stringify({ type: "TEXT", text: message }),
-    })).json();
-    res.json({ ok: true, messageId: data.id, lead: leadName });
+    const data = await sendWhatsApp(phone, message);
+    if (data.error_code) throw new Error(data.message);
+    res.json({ ok: true, messageId: data.sid, lead: leadName });
   } catch (err) { next(err); }
 });
 
+// POST /messages/bulk
 app.post("/messages/bulk", async (req, res, next) => {
   try {
     const { leads, template } = req.body;
     if (!leads?.length) return res.status(400).json({ error: "leads requerido" });
-    const token = await getJelouToken();
     const results = [];
     for (const lead of leads) {
-      const msg = template.replace(/\{\{nombre\}\}/g, lead.name || lead.nombre || "").replace(/\{\{empresa\}\}/g, lead.empresa || "").replace(/\{\{ciudad\}\}/g, lead.ciudad || "");
+      const msg = template
+        .replace(/\{\{nombre\}\}/g, lead.name || lead.nombre || "")
+        .replace(/\{\{empresa\}\}/g, lead.empresa || "")
+        .replace(/\{\{ciudad\}\}/g, lead.ciudad || "");
       try {
-        const d = await (await fetch(`https://api.jelou.ai/v1/bots/${process.env.JELOU_BOT_ID}/users/${lead.phone}/messages`, {
-          method: "POST", headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
-          body: JSON.stringify({ type: "TEXT", text: msg }),
-        })).json();
-        results.push({ phone: lead.phone, ok: true, id: d.id });
+        const d = await sendWhatsApp(lead.phone, msg);
+        results.push({ phone: lead.phone, ok: !d.error_code, id: d.sid, error: d.message });
       } catch (e) { results.push({ phone: lead.phone, ok: false, error: e.message }); }
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 1000)); // 1 msg/seg para evitar rate limit
     }
     res.json({ sent: results.filter(r => r.ok).length, failed: results.filter(r => !r.ok).length, results });
+  } catch (err) { next(err); }
+});
+
+// POST /messages/test — enviar mensaje de prueba
+app.post("/messages/test", async (req, res, next) => {
+  try {
+    const { phone, message = "¡Hola desde PrismDB! 🚀 Tu plataforma de prospección y ventas está funcionando." } = req.body;
+    if (!phone) return res.status(400).json({ error: "phone requerido (sin +57, ej: 3001234567)" });
+    const data = await sendWhatsApp(phone, message);
+    if (data.error_code) throw new Error(`Twilio error ${data.error_code}: ${data.message}`);
+    res.json({ ok: true, messageId: data.sid, to: data.to, status: data.status });
   } catch (err) { next(err); }
 });
 
@@ -113,7 +129,7 @@ app.post("/messages/bulk", async (req, res, next) => {
 app.post("/ai/message", async (req, res, next) => {
   try {
     const { lead, prompt, businessContext = "" } = req.body;
-    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+    const aiData = await (await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({
@@ -121,26 +137,24 @@ app.post("/ai/message", async (req, res, next) => {
         system: `Eres experto en ventas B2B para LATAM. Genera mensajes WhatsApp personalizados, directos. Máximo 160 caracteres. Contexto: ${businessContext}`,
         messages: [{ role: "user", content: prompt || `Genera mensaje para: ${lead.nombre}, ${lead.cargo} en ${lead.empresa} (${lead.ciudad}).` }],
       }),
-    });
-    const data = await aiRes.json();
-    res.json({ message: data.content?.[0]?.text || "", lead });
+    })).json();
+    res.json({ message: aiData.content?.[0]?.text || "", lead });
   } catch (err) { next(err); }
 });
 
 app.post("/ai/score", async (req, res, next) => {
   try {
     const { profile, criteria } = req.body;
-    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+    const aiData = await (await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({
         model: "claude-haiku-4-5-20251001", max_tokens: 300,
-        messages: [{ role: "user", content: `Score 0-100 como prospecto. SOLO JSON: {"score":85,"nivel":"Alto","razones":[],"recomendacion":"..."}
+        messages: [{ role: "user", content: `Score 0-100. SOLO JSON: {"score":85,"nivel":"Alto","razones":[],"recomendacion":"..."}
 Perfil: ${JSON.stringify(profile)} Criterios: ${JSON.stringify(criteria)}` }],
       }),
-    });
-    const data = await aiRes.json();
-    res.json(JSON.parse(data.content?.[0]?.text?.replace(/```json|```/g, "").trim() || "{}"));
+    })).json();
+    res.json(JSON.parse(aiData.content?.[0]?.text?.replace(/```json|```/g, "").trim() || "{}"));
   } catch (err) { next(err); }
 });
 
@@ -169,11 +183,14 @@ app.patch("/crm/lead/:id/move", (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════
-//  5. WEBHOOK Jelou
+//  5. WEBHOOK Twilio — recibir mensajes entrantes
 // ════════════════════════════════════════════════════════════
-app.post("/webhook/jelou", (req, res) => {
-  console.log(`[JELOU WEBHOOK] ${req.body.event}:`, JSON.stringify(req.body.data).slice(0, 200));
-  res.sendStatus(200);
+app.post("/webhook/twilio", express.urlencoded({ extended: false }), (req, res) => {
+  const { From, Body, ProfileName } = req.body;
+  console.log(`[TWILIO WEBHOOK] ${ProfileName || From}: ${Body}`);
+  // TODO: procesar respuestas y mover leads en el pipeline
+  res.set('Content-Type', 'text/xml');
+  res.send('<Response></Response>');
 });
 
 // ════════════════════════════════════════════════════════════
@@ -242,14 +259,10 @@ app.post("/talent/contact", async (req, res, next) => {
   try {
     const { phone, candidateName, cargo, matchScore, tiene = [], falta = [], mensaje } = req.body;
     if (!phone) return res.status(400).json({ error: "phone requerido" });
-    const token = await getJelouToken();
     const msg = mensaje || `Hola ${candidateName}, tu perfil hace ${matchScore}% match con ${cargo}. Tienes: ${tiene.slice(0,2).join(", ")}. ¿Te interesa saber más?`;
-    const data = await (await fetch(`https://api.jelou.ai/v1/bots/${process.env.JELOU_BOT_ID}/users/${phone}/messages`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
-      body: JSON.stringify({ type: "TEXT", text: msg }),
-    })).json();
-    res.json({ ok: true, messageId: data.id, candidate: candidateName, mensaje: msg });
+    const data = await sendWhatsApp(phone, msg);
+    if (data.error_code) throw new Error(`Twilio error: ${data.message}`);
+    res.json({ ok: true, messageId: data.sid, candidate: candidateName, mensaje: msg });
   } catch (err) { next(err); }
 });
 
@@ -274,143 +287,71 @@ app.patch("/talent/pipeline/:id/move", (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════
-//  7. MERCADO PAGO — Pagos y suscripciones
+//  7. MERCADO PAGO
 // ════════════════════════════════════════════════════════════
-
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || 'TEST-748633123758950-051218-c76f920ae7147ecd648d1d9225667eba-503051039';
 const FRONTEND_URL    = process.env.FRONTEND_URL || 'https://prismdb.netlify.app';
 
 const PLANES_MP = {
-  semilla:   { nombre: 'PrismDB Semilla',         precio: 99   },
-  starter:   { nombre: 'PrismDB Starter',         precio: 249  },
-  pro:       { nombre: 'PrismDB Pro',             precio: 599  },
-  enterprise:{ nombre: 'PrismDB Enterprise',      precio: 1299 },
-  talent:    { nombre: 'PrismDB Talent Scanner',  precio: 299  },
+  semilla:   { nombre: 'PrismDB Semilla',        precio: 99   },
+  starter:   { nombre: 'PrismDB Starter',        precio: 249  },
+  pro:       { nombre: 'PrismDB Pro',            precio: 599  },
+  enterprise:{ nombre: 'PrismDB Enterprise',     precio: 1299 },
+  talent:    { nombre: 'PrismDB Talent Scanner', precio: 299  },
 };
 
-// POST /payment/preference — Crea link de pago (checkout externo MP)
 app.post("/payment/preference", async (req, res, next) => {
   try {
     const { plan = 'starter', email = 'cliente@prismdb.co', amount, description } = req.body;
     const p = PLANES_MP[plan] || PLANES_MP.starter;
-
     const body = {
-      items: [{
-        id:          plan,
-        title:       description || p.nombre,
-        quantity:    1,
-        unit_price:  amount || p.precio,
-        currency_id: 'COP',
-      }],
+      items: [{ id: plan, title: description || p.nombre, quantity: 1, unit_price: amount || p.precio, currency_id: 'COP' }],
       payer: { email },
-      back_urls: {
-        success: `${FRONTEND_URL}?payment=success&plan=${plan}`,
-        failure: `${FRONTEND_URL}?payment=failure`,
-        pending: `${FRONTEND_URL}?payment=pending`,
-      },
-      auto_return:          'approved',
-      notification_url:     `${process.env.BACKEND_URL || 'https://prismdb-backend-production.up.railway.app'}/payment/webhook`,
+      back_urls: { success: `${FRONTEND_URL}?payment=success&plan=${plan}`, failure: `${FRONTEND_URL}?payment=failure`, pending: `${FRONTEND_URL}?payment=pending` },
+      auto_return: 'approved',
+      notification_url: `${process.env.BACKEND_URL || 'https://prismdb-backend-production.up.railway.app'}/payment/webhook`,
       statement_descriptor: 'PRISMDB',
-      expires:              false,
     };
-
-    const mpRes = await fetch('https://api.mercadopago.com/checkout/preferences', {
-      method:  'POST',
+    const data = await (await fetch('https://api.mercadopago.com/checkout/preferences', {
+      method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` },
-      body:    JSON.stringify(body),
-    });
-
-    const data = await mpRes.json();
+      body: JSON.stringify(body),
+    })).json();
     if (data.error) throw new Error(data.message || data.error);
-
-    res.json({
-      preference_id: data.id,
-      init_point:    data.init_point,       // producción
-      sandbox_url:   data.sandbox_init_point, // pruebas
-    });
+    res.json({ preference_id: data.id, init_point: data.init_point, sandbox_url: data.sandbox_init_point });
   } catch (err) { next(err); }
 });
 
-// POST /payment/create — Procesa token de tarjeta (cardForm)
 app.post("/payment/create", async (req, res, next) => {
   try {
-    const {
-      token, paymentMethodId, issuerId, installments = 1,
-      identificationNumber, identificationType = 'CC',
-      email, plan = 'starter', amount, description
-    } = req.body;
-
+    const { token, paymentMethodId, issuerId, installments = 1, identificationNumber, identificationType = 'CC', email, plan = 'starter', amount, description } = req.body;
     if (!token) return res.status(400).json({ error: 'token requerido' });
-
     const p = PLANES_MP[plan] || PLANES_MP.starter;
-
-    const body = {
-      transaction_amount: amount || p.precio,
-      token,
-      description:        description || p.nombre,
-      installments:       Number(installments) || 1,
-      payment_method_id:  paymentMethodId,
-      issuer_id:          issuerId,
-      payer: {
-        email,
-        identification: { type: identificationType, number: identificationNumber },
-      },
-      metadata: { plan, prismdb: true },
-    };
-
-    const mpRes = await fetch('https://api.mercadopago.com/v1/payments', {
-      method:  'POST',
-      headers: {
-        'Content-Type':   'application/json',
-        'Authorization':  `Bearer ${MP_ACCESS_TOKEN}`,
-        'X-Idempotency-Key': `${plan}-${email}-${Date.now()}`,
-      },
-      body: JSON.stringify(body),
-    });
-
-    const data = await mpRes.json();
-
+    const data = await (await fetch('https://api.mercadopago.com/v1/payments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${MP_ACCESS_TOKEN}`, 'X-Idempotency-Key': `${plan}-${email}-${Date.now()}` },
+      body: JSON.stringify({ transaction_amount: amount || p.precio, token, description: description || p.nombre, installments: Number(installments) || 1, payment_method_id: paymentMethodId, issuer_id: issuerId, payer: { email, identification: { type: identificationType, number: identificationNumber } }, metadata: { plan } }),
+    })).json();
     if (data.error) throw new Error(data.message || data.error);
-
-    // Guardar suscripción en memoria (en prod: guardar en Supabase)
-    console.log(`[PAYMENT] ${data.status} — ${email} — Plan ${plan} — $${p.precio}`);
-
-    res.json({
-      id:            data.id,
-      status:        data.status,         // approved | in_process | rejected
-      status_detail: data.status_detail,
-      plan,
-      email,
-    });
+    console.log(`[PAYMENT] ${data.status} — ${email} — Plan ${plan}`);
+    res.json({ id: data.id, status: data.status, status_detail: data.status_detail, plan, email });
   } catch (err) { next(err); }
 });
 
-// POST /payment/webhook — Notificaciones de MercadoPago
 app.post("/payment/webhook", async (req, res) => {
   try {
     const { type, data } = req.body;
     if (type === 'payment' && data?.id) {
-      const mpRes  = await fetch(`https://api.mercadopago.com/v1/payments/${data.id}`, {
-        headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` },
-      });
-      const payment = await mpRes.json();
+      const payment = await (await fetch(`https://api.mercadopago.com/v1/payments/${data.id}`, { headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` } })).json();
       console.log(`[WEBHOOK MP] ${payment.status} — ${payment.payer?.email} — $${payment.transaction_amount}`);
-      // TODO: activar cuenta en Supabase según payment.metadata.plan
     }
     res.sendStatus(200);
-  } catch (err) {
-    console.error('[WEBHOOK MP ERROR]', err.message);
-    res.sendStatus(200); // siempre 200 para MP
-  }
+  } catch { res.sendStatus(200); }
 });
 
-// GET /payment/status/:id — Consultar estado de un pago
 app.get("/payment/status/:id", async (req, res, next) => {
   try {
-    const mpRes = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.id}`, {
-      headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` },
-    });
-    const data = await mpRes.json();
+    const data = await (await fetch(`https://api.mercadopago.com/v1/payments/${req.params.id}`, { headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` } })).json();
     res.json({ id: data.id, status: data.status, status_detail: data.status_detail, plan: data.metadata?.plan });
   } catch (err) { next(err); }
 });
@@ -423,5 +364,5 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, () => {
   console.log(`✅ PrismDB backend corriendo en http://localhost:${PORT}`);
-  console.log(`   Integraciones: Firecrawl · Jelou · Anthropic · MercadoPago`);
+  console.log(`   Integraciones: Firecrawl · Twilio WhatsApp · Anthropic · MercadoPago`);
 });
