@@ -356,6 +356,50 @@ app.get("/payment/status/:id", async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ════════════════════════════════════════════════════════════
+//  8. CATÁLOGO — Extraer producto desde redes sociales
+// ════════════════════════════════════════════════════════════
+
+// POST /catalog/extract
+// Body: { url } — URL de post de Instagram, Facebook, TikTok
+app.post("/catalog/extract", async (req, res, next) => {
+  try {
+    const { url } = req.body;
+    if (!url) return res.status(400).json({ error: "url requerida" });
+
+    // 1. Firecrawl scrape the URL
+    const fcRes = await fetch("https://api.firecrawl.dev/v1/scrape", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.FIRECRAWL_API_KEY}` },
+      body: JSON.stringify({ url, formats: ["markdown", "screenshot"] }),
+    });
+    const fcData = await fcRes.json();
+    const content = fcData.data?.markdown || fcData.markdown || "";
+
+    // 2. Claude extrae nombre, precio, descripción
+    const prompt = `Analiza este contenido de redes sociales y extrae la información del producto. Devuelve SOLO JSON:
+{
+  "nombre": "nombre del producto",
+  "precio": "precio con símbolo de moneda o null",
+  "descripcion": "descripción del producto en 1-2 oraciones",
+  "imagen_url": "url de imagen si la detectas o null"
+}
+
+Contenido: ${content.slice(0, 2000)}`;
+
+    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-haiku-4-5-20251001", max_tokens: 300, messages: [{ role: "user", content: prompt }] }),
+    });
+    const aiData = await aiRes.json();
+    const text = aiData.content?.[0]?.text || "{}";
+    const product = JSON.parse(text.replace(/```json|```/g, "").trim());
+
+    res.json({ ...product, url, fuente: new URL(url).hostname });
+  } catch (err) { next(err); }
+});
+
 // ── Error handler ────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error("[ERROR]", err.message);
