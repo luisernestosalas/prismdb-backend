@@ -785,7 +785,544 @@ app.post("/router/test", async (req, res, next) => {
     res.json({ ok: true, test: true, result });
   } catch (err) { next(err); }
 });
+// ═══════════════════════════════════════════════════════════
+//  PrismDB — Módulo Ventas Activas
+//  Carga de bases · Catálogos · Campañas · Clientes inactivos
+//
+//  AGREGAR AL FINAL DE prismdb-backend.js
+//  (antes del error handler)
+// ═══════════════════════════════════════════════════════════
 
+// ══════════════════════════════════════════════════════════
+//  HELPERS INTERNOS
+// ══════════════════════════════════════════════════════════
+
+// Parsear CSV simple (sin librerías)
+function parseCSV(text) {
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
+  return lines.slice(1).map(line => {
+    const vals = line.split(',').map(v => v.trim().replace(/"/g, ''));
+    const obj = {};
+    headers.forEach((h, i) => obj[h] = vals[i] || '');
+    return obj;
+  }).filter(r => Object.values(r).some(v => v));
+}
+
+// Normalizar campos de contacto (acepta columnas con distintos nombres)
+function normalizeContact(raw) {
+  const find = (...keys) => {
+    for (const k of keys) {
+      if (raw[k] !== undefined && raw[k] !== '') return raw[k];
+    }
+    return '';
+  };
+  return {
+    nombre:   find('nombre', 'name', 'cliente', 'razon_social', 'empresa'),
+    telefono: find('telefono', 'phone', 'celular', 'movil', 'whatsapp', 'tel'),
+    email:    find('email', 'correo', 'mail'),
+    empresa:  find('empresa', 'company', 'negocio', 'razon_social'),
+    ciudad:   find('ciudad', 'city', 'municipio'),
+    segmento: find('segmento', 'segment', 'categoria', 'tipo', 'grupo'),
+    notas:    find('notas', 'notes', 'observaciones', 'comentarios'),
+    ...raw,
+  };
+}
+
+// In-memory store para bases de datos cargadas (fallback si no hay DB)
+const activaStore = {
+  bases: {},       // id → { nombre, contactos[], created_at }
+  catalogos: {},   // id → { nombre, productos[], created_at }
+  campanas: {},    // id → { config, resultados[], created_at }
+};
+
+// ══════════════════════════════════════════════════════════
+//  1. BASES DE DATOS
+// ══════════════════════════════════════════════════════════
+
+// POST /activa/base/upload — subir base de datos (CSV text o JSON array)
+app.post("/activa/base/upload", async (req, res, next) => {
+  try {
+    const { nombre = "Base sin nombre", formato = "json", data, csv_text } = req.body;
+
+    let contactos = [];
+
+    if (formato === "csv" && csv_text) {
+      const raw = parseCSV(csv_text);
+      contactos = raw.map(normalizeContact);
+    } else if (Array.isArray(data)) {
+      contactos = data.map(normalizeContact);
+    } else {
+      return res.status(400).json({ error: "Envía 'data' (array JSON) o 'csv_text' con formato:'csv'" });
+    }
+
+    if (!contactos.length) return res.status(400).json({ error: "No se encontraron contactos válidos" });
+
+    const baseId = `base_${Date.now()}`;
+    const base = {
+      id: baseId,
+      nombre,
+      total: contactos.length,
+      contactos,
+      con_telefono: contactos.filter(c => c.telefono).length,
+      con_email: contactos.filter(c => c.email).length,
+      segmentos: [...new Set(contactos.map(c => c.segmento).filter(Boolean))],
+      created_at: new Date().toISOString(),
+    };
+
+    // Guardar en PostgreSQL si disponible
+    if (db && memoryMode === "postgresql") {
+      for (const contacto of contactos) {
+        const entityId = contacto.telefono || contacto.email || `${baseId}_${Math.random().toString(36).slice(2,8)}`;
+        await db.query(`
+          INSERT INTO memory (entity_id, entity_type, data)
+          VALUES ($1, 'activa_contact', $2)
+          ON CONFLICT (entity_id) DO UPDATE
+            SET data = memory.data || $2, updated_at = NOW()
+        `, [entityId, { ...contacto, base_id: baseId, base_nombre: nombre, loaded_at: new Date().toISOString() }])
+        .catch(() => {});
+      }
+    }
+
+    activaStore.bases[baseId] = base;
+
+    // Análisis IA de la base
+    const analisis = await claudeChat(
+      "Analista de bases de datos comerciales. Responde en JSON.",
+      `Analiza esta base de contactos y da recomendaciones. SOLO JSON:
+{"calidad":"alta|media|baja","completitud":85,"segmentos_detectados":[],"recomendacion_campana":"...","mensaje_tipo":"...","mejor_horario":"..."}
+Muestra (primeros 5): ${JSON.stringify(contactos.slice(0,5))}
+Total: ${contactos.length} | Con teléfono: ${base.con_telefono} | Segmentos: ${base.segmentos.join(', ')||'sin segmentar'}`,
+      "claude-haiku-4-5-20251001", 400
+    ).catch(() => "{}");
+
+    let analisisObj = {};
+    try { analisisObj = JSON.parse(analisis.replace(/```json|```/g, "").trim()); } catch {}
+
+    res.status(201).json({ ok: true, base_id: baseId, ...base, analisis: analisisObj });
+  } catch (err) { next(err); }
+});
+
+// GET /activa/base — listar todas las bases
+app.get("/activa/base", async (_req, res, next) => {
+  try {
+    const bases = Object.values(activaStore.bases).map(b => ({
+      id: b.id, nombre: b.nombre, total: b.total,
+      con_telefono: b.con_telefono, segmentos: b.segmentos, created_at: b.created_at,
+    }));
+    res.json({ bases, total: bases.length });
+  } catch (err) { next(err); }
+});
+
+// GET /activa/base/:id — detalle de una base
+app.get("/activa/base/:id", (req, res) => {
+  const base = activaStore.bases[req.params.id];
+  if (!base) return res.status(404).json({ error: "Base no encontrada" });
+  res.json(base);
+});
+
+// ══════════════════════════════════════════════════════════
+//  2. CATÁLOGOS
+// ══════════════════════════════════════════════════════════
+
+// POST /activa/catalogo — crear catálogo de productos
+app.post("/activa/catalogo", async (req, res, next) => {
+  try {
+    const { nombre = "Catálogo", productos = [], descripcion_empresa = "" } = req.body;
+
+    if (!productos.length) return res.status(400).json({ error: "productos[] requerido" });
+
+    const catalogoId = `cat_${Date.now()}`;
+
+    // Claude genera descripción optimizada para WhatsApp de cada producto
+    const productosOptimizados = await Promise.all(
+      productos.slice(0, 20).map(async (p) => {
+        const msg = await claudeChat(
+          "Experto en ventas por WhatsApp. Crea descripciones cortas, atractivas y con emoji. Máx 120 chars.",
+          `Producto: ${p.nombre} | Precio: ${p.precio || 'consultar'} | Descripción: ${p.descripcion || ''}
+Contexto empresa: ${descripcion_empresa}
+Devuelve SOLO el mensaje WhatsApp optimizado.`
+        ).catch(() => `${p.nombre} - $${p.precio || 'Consultar'}`);
+        return { ...p, mensaje_wa: msg.trim() };
+      })
+    );
+
+    const catalogo = {
+      id: catalogoId,
+      nombre,
+      descripcion_empresa,
+      productos: productosOptimizados,
+      total_productos: productosOptimizados.length,
+      created_at: new Date().toISOString(),
+    };
+
+    activaStore.catalogos[catalogoId] = catalogo;
+    res.status(201).json({ ok: true, catalogo_id: catalogoId, ...catalogo });
+  } catch (err) { next(err); }
+});
+
+// GET /activa/catalogo — listar catálogos
+app.get("/activa/catalogo", (_req, res) => {
+  const catalogos = Object.values(activaStore.catalogos).map(c => ({
+    id: c.id, nombre: c.nombre, total_productos: c.total_productos, created_at: c.created_at,
+  }));
+  res.json({ catalogos, total: catalogos.length });
+});
+
+// POST /activa/catalogo/extract — extraer catálogo desde URL (Instagram, web, etc.)
+app.post("/activa/catalogo/extract", async (req, res, next) => {
+  try {
+    const { url, nombre = "Catálogo extraído" } = req.body;
+    if (!url) return res.status(400).json({ error: "url requerida" });
+
+    const fcData = await (await fetch("https://api.firecrawl.dev/v1/scrape", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.FIRECRAWL_API_KEY}` },
+      body: JSON.stringify({ url, formats: ["markdown"] }),
+    })).json();
+
+    const content = fcData.data?.markdown || fcData.markdown || "";
+
+    const extraction = await claudeChat(
+      "Extrae productos de contenido web/redes sociales. SOLO JSON.",
+      `Extrae todos los productos que encuentres. JSON:
+{"productos":[{"nombre":"...","precio":"...","descripcion":"...","disponible":true}]}
+Contenido: ${content.slice(0, 3000)}`
+    );
+
+    let productos = [];
+    try {
+      const parsed = JSON.parse(extraction.replace(/```json|```/g, "").trim());
+      productos = parsed.productos || [];
+    } catch {}
+
+    const catalogoId = `cat_${Date.now()}`;
+    activaStore.catalogos[catalogoId] = {
+      id: catalogoId, nombre, productos, total_productos: productos.length,
+      fuente: url, created_at: new Date().toISOString(),
+    };
+
+    res.json({ ok: true, catalogo_id: catalogoId, productos, total: productos.length, fuente: url });
+  } catch (err) { next(err); }
+});
+
+// ══════════════════════════════════════════════════════════
+//  3. CAMPAÑAS
+// ══════════════════════════════════════════════════════════
+
+// POST /activa/campana/preview — previsualizar mensajes antes de enviar
+app.post("/activa/campana/preview", async (req, res, next) => {
+  try {
+    const {
+      base_id, catalogo_id, tipo = "catalogo",
+      template, segmento, limit = 5,
+      promocion, contexto_empresa = ""
+    } = req.body;
+
+    if (!base_id) return res.status(400).json({ error: "base_id requerido" });
+
+    const base = activaStore.bases[base_id];
+    if (!base) return res.status(404).json({ error: "Base no encontrada" });
+
+    let contactos = base.contactos;
+    if (segmento) contactos = contactos.filter(c => c.segmento === segmento);
+    const muestra = contactos.slice(0, limit);
+
+    const catalogo = catalogo_id ? activaStore.catalogos[catalogo_id] : null;
+
+    const previews = await Promise.all(muestra.map(async (contacto) => {
+      let mensaje;
+
+      if (template) {
+        // Template con variables
+        mensaje = template
+          .replace(/\{\{nombre\}\}/gi, contacto.nombre || "estimado cliente")
+          .replace(/\{\{empresa\}\}/gi, contacto.empresa || "")
+          .replace(/\{\{ciudad\}\}/gi, contacto.ciudad || "")
+          .replace(/\{\{segmento\}\}/gi, contacto.segmento || "");
+      } else if (tipo === "catalogo" && catalogo) {
+        const productos_texto = catalogo.productos.slice(0, 3)
+          .map(p => p.mensaje_wa || `• ${p.nombre} - $${p.precio}`).join('\n');
+        mensaje = await claudeChat(
+          "Ventas por WhatsApp LATAM. Mensaje personalizado, cálido, máx 200 chars con emoji.",
+          `Cliente: ${contacto.nombre} | Empresa: ${contacto.empresa} | Ciudad: ${contacto.ciudad}
+Catálogo: ${catalogo.nombre}
+Productos destacados:\n${productos_texto}
+Contexto: ${contexto_empresa}
+Genera el mensaje personalizado para este cliente.`
+        );
+      } else if (tipo === "promocion" && promocion) {
+        mensaje = await claudeChat(
+          "Ventas por WhatsApp LATAM. Mensaje de promoción personalizado, máx 160 chars, con urgencia.",
+          `Cliente: ${contacto.nombre} | Empresa: ${contacto.empresa}
+Promoción: ${promocion}
+Contexto: ${contexto_empresa}
+Genera el mensaje.`
+        );
+      } else {
+        mensaje = `Hola ${contacto.nombre}, tenemos novedades para ti. ¿Te interesa conocerlas?`;
+      }
+
+      return { contacto: { nombre: contacto.nombre, telefono: contacto.telefono, empresa: contacto.empresa }, mensaje: mensaje.trim() };
+    }));
+
+    res.json({
+      ok: true, tipo, base_id, total_en_base: contactos.length,
+      segmento: segmento || "todos", previews,
+      estimado_envio: contactos.filter(c => c.telefono).length,
+    });
+  } catch (err) { next(err); }
+});
+
+// POST /activa/campana/send — enviar campaña
+app.post("/activa/campana/send", async (req, res, next) => {
+  try {
+    const {
+      base_id, catalogo_id, tipo = "catalogo",
+      template, segmento, limite_envios = 50,
+      promocion, contexto_empresa = "",
+      delay_ms = 1500, // delay entre mensajes para evitar spam
+    } = req.body;
+
+    if (!base_id) return res.status(400).json({ error: "base_id requerido" });
+
+    const base = activaStore.bases[base_id];
+    if (!base) return res.status(404).json({ error: "Base no encontrada" });
+
+    let contactos = base.contactos.filter(c => c.telefono);
+    if (segmento) contactos = contactos.filter(c => c.segmento === segmento);
+    contactos = contactos.slice(0, limite_envios);
+
+    if (!contactos.length) return res.status(400).json({ error: "No hay contactos con teléfono en esta base/segmento" });
+
+    const campanaId = `camp_${Date.now()}`;
+    const catalogo = catalogo_id ? activaStore.catalogos[catalogo_id] : null;
+
+    // Enviar en background
+    const resultados = [];
+    let enviados = 0, fallidos = 0;
+
+    // Respuesta inmediata con el ID de campaña
+    res.json({
+      ok: true, campana_id: campanaId,
+      total_a_enviar: contactos.length,
+      status: "sending",
+      message: `Campaña iniciada. Enviando ${contactos.length} mensajes con delay de ${delay_ms}ms entre cada uno.`,
+    });
+
+    // Proceso de envío en background
+    (async () => {
+      for (const contacto of contactos) {
+        try {
+          let mensaje;
+
+          if (template) {
+            mensaje = template
+              .replace(/\{\{nombre\}\}/gi, contacto.nombre || "estimado cliente")
+              .replace(/\{\{empresa\}\}/gi, contacto.empresa || "")
+              .replace(/\{\{ciudad\}\}/gi, contacto.ciudad || "")
+              .replace(/\{\{segmento\}\}/gi, contacto.segmento || "");
+          } else if (tipo === "catalogo" && catalogo) {
+            const productos_texto = catalogo.productos.slice(0, 3)
+              .map(p => p.mensaje_wa || `• ${p.nombre} - $${p.precio}`).join('\n');
+            mensaje = await claudeChat(
+              "Ventas WhatsApp. Mensaje corto personalizado máx 200 chars.",
+              `Cliente: ${contacto.nombre} | Catálogo: ${catalogo.nombre}\nProductos: ${productos_texto}\nContexto: ${contexto_empresa}\nGenera mensaje.`
+            );
+          } else if (tipo === "promocion") {
+            mensaje = await claudeChat(
+              "Ventas WhatsApp. Mensaje de promoción personalizado máx 160 chars.",
+              `Cliente: ${contacto.nombre} | Empresa: ${contacto.empresa}\nPromoción: ${promocion}\nGenera mensaje.`
+            );
+          } else {
+            mensaje = `Hola ${contacto.nombre || ""}! Tenemos novedades. ¿Te cuento? 🚀`;
+          }
+
+          // Enviar WhatsApp
+          const data = await sendWhatsApp(contacto.telefono, mensaje.trim());
+          const ok = !data.error_code;
+
+          resultados.push({ telefono: contacto.telefono, nombre: contacto.nombre, ok, sid: data.sid, mensaje: mensaje.trim() });
+          if (ok) enviados++; else fallidos++;
+
+          // Guardar en memoria
+          if (db && memoryMode === "postgresql" && contacto.telefono) {
+            await db.query(`
+              INSERT INTO memory (entity_id, entity_type, data)
+              VALUES ($1, 'activa_contact', $2)
+              ON CONFLICT (entity_id) DO UPDATE SET data = memory.data || $2, updated_at = NOW()
+            `, [contacto.telefono, {
+              nombre: contacto.nombre, last_campana: campanaId,
+              last_mensaje_enviado: mensaje.trim(), last_contact: new Date().toISOString(),
+            }]).catch(() => {});
+          }
+
+          await new Promise(r => setTimeout(r, delay_ms));
+        } catch (e) {
+          resultados.push({ telefono: contacto.telefono, nombre: contacto.nombre, ok: false, error: e.message });
+          fallidos++;
+        }
+      }
+
+      activaStore.campanas[campanaId] = {
+        id: campanaId, base_id, tipo, enviados, fallidos,
+        total: contactos.length, resultados,
+        completed_at: new Date().toISOString(),
+      };
+
+      console.log(`[CAMPAÑA ${campanaId}] Completada: ${enviados} enviados, ${fallidos} fallidos`);
+    })();
+
+  } catch (err) { next(err); }
+});
+
+// GET /activa/campana/:id — resultado de una campaña
+app.get("/activa/campana/:id", (req, res) => {
+  const campana = activaStore.campanas[req.params.id];
+  if (!campana) return res.json({ status: "sending", message: "Campaña en proceso..." });
+  res.json({ status: "completed", ...campana });
+});
+
+// GET /activa/campana — listar campañas
+app.get("/activa/campana", (_req, res) => {
+  const campanas = Object.values(activaStore.campanas).map(c => ({
+    id: c.id, base_id: c.base_id, tipo: c.tipo,
+    enviados: c.enviados, fallidos: c.fallidos,
+    total: c.total, completed_at: c.completed_at,
+  }));
+  res.json({ campanas, total: campanas.length });
+});
+
+// ══════════════════════════════════════════════════════════
+//  4. CLIENTES INACTIVOS
+// ══════════════════════════════════════════════════════════
+
+// GET /activa/inactivos — detectar clientes sin contacto reciente
+app.get("/activa/inactivos", async (req, res, next) => {
+  try {
+    const { dias = 14 } = req.query;
+
+    if (db && memoryMode === "postgresql") {
+      const result = await db.query(`
+        SELECT entity_id, data, updated_at
+        FROM memory
+        WHERE entity_type IN ('contact', 'activa_contact')
+          AND updated_at < NOW() - INTERVAL '${parseInt(dias)} days'
+        ORDER BY updated_at ASC
+        LIMIT 50
+      `);
+      return res.json({
+        inactivos: result.rows.map(r => ({
+          id: r.entity_id,
+          nombre: r.data?.nombre,
+          telefono: r.data?.telefono || r.entity_id,
+          empresa: r.data?.empresa,
+          ultimo_contacto: r.updated_at,
+          dias_inactivo: Math.floor((Date.now() - new Date(r.updated_at)) / 86400000),
+        })),
+        total: result.rowCount,
+        dias_umbral: parseInt(dias),
+      });
+    }
+
+    res.json({ inactivos: [], total: 0, dias_umbral: parseInt(dias), mode: "in-memory" });
+  } catch (err) { next(err); }
+});
+
+// POST /activa/inactivos/reactivar — enviar campaña de reactivación
+app.post("/activa/inactivos/reactivar", async (req, res, next) => {
+  try {
+    const { dias = 14, mensaje_template, limite = 20, contexto_empresa = "" } = req.body;
+
+    if (!db || memoryMode !== "postgresql") {
+      return res.status(400).json({ error: "Requiere PostgreSQL activo" });
+    }
+
+    const result = await db.query(`
+      SELECT entity_id, data FROM memory
+      WHERE entity_type IN ('contact', 'activa_contact')
+        AND updated_at < NOW() - INTERVAL '${parseInt(dias)} days'
+        AND (data->>'reactivacion_enviada') IS DISTINCT FROM 'true'
+      LIMIT $1
+    `, [limite]);
+
+    if (!result.rows.length) {
+      return res.json({ ok: true, message: "No hay clientes inactivos para reactivar", enviados: 0 });
+    }
+
+    const resultados = [];
+    res.json({ ok: true, total: result.rows.length, status: "sending", message: `Reactivando ${result.rows.length} clientes...` });
+
+    (async () => {
+      for (const row of result.rows) {
+        const contacto = row.data || {};
+        const telefono = contacto.telefono || row.entity_id;
+        if (!telefono || telefono.startsWith('base_')) continue;
+
+        try {
+          const mensaje = mensaje_template
+            ? mensaje_template.replace(/\{\{nombre\}\}/gi, contacto.nombre || "estimado cliente")
+            : await claudeChat(
+                "Ventas WhatsApp. Mensaje de reactivación cálido, sin ser invasivo. Máx 140 chars.",
+                `Cliente: ${contacto.nombre || "cliente"} | Empresa: ${contacto.empresa || ""}
+Lleva ${Math.floor((Date.now() - new Date(row.updated_at))/86400000)} días sin contacto.
+Contexto: ${contexto_empresa}
+Genera mensaje de reactivación.`
+              );
+
+          await sendWhatsApp(telefono, mensaje.trim());
+          await db.query(
+            `UPDATE memory SET data = data || '{"reactivacion_enviada":"true","reactivacion_fecha":"${new Date().toISOString()}"}', updated_at = NOW() WHERE entity_id = $1`,
+            [row.entity_id]
+          ).catch(() => {});
+
+          resultados.push({ id: row.entity_id, nombre: contacto.nombre, ok: true });
+          await new Promise(r => setTimeout(r, 1500));
+        } catch (e) {
+          resultados.push({ id: row.entity_id, nombre: contacto.nombre, ok: false, error: e.message });
+        }
+      }
+      console.log(`[REACTIVACIÓN] ${resultados.filter(r=>r.ok).length}/${resultados.length} enviados`);
+    })();
+
+  } catch (err) { next(err); }
+});
+
+// ══════════════════════════════════════════════════════════
+//  5. SEGMENTACIÓN IA
+// ══════════════════════════════════════════════════════════
+
+// POST /activa/segmentar — Claude segmenta una base automáticamente
+app.post("/activa/segmentar", async (req, res, next) => {
+  try {
+    const { base_id, criterios = "" } = req.body;
+    if (!base_id) return res.status(400).json({ error: "base_id requerido" });
+
+    const base = activaStore.bases[base_id];
+    if (!base) return res.status(404).json({ error: "Base no encontrada" });
+
+    const muestra = base.contactos.slice(0, 30);
+
+    const segmentacion = await claudeChat(
+      "Analista de datos comerciales. Segmenta contactos para campañas. SOLO JSON.",
+      `Analiza estos ${base.total} contactos y propón segmentos para campañas.
+Muestra: ${JSON.stringify(muestra)}
+Criterios adicionales: ${criterios}
+
+JSON: {"segmentos":[{"nombre":"...","descripcion":"...","criterio":"...","tamaño_estimado":0,"prioridad":"alta|media|baja","mensaje_recomendado":"..."}]}`,
+      "claude-sonnet-4-20250514", 800
+    );
+
+    let segmentos = [];
+    try {
+      const parsed = JSON.parse(segmentacion.replace(/```json|```/g, "").trim());
+      segmentos = parsed.segmentos || [];
+    } catch {}
+
+    res.json({ ok: true, base_id, total_contactos: base.total, segmentos });
+  } catch (err) { next(err); }
+});
 // ── Error handler ─────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error("[ERROR]", err.message);
