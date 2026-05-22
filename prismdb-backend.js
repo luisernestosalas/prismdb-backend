@@ -785,7 +785,7 @@ app.post("/router/test", async (req, res, next) => {
     res.json({ ok: true, test: true, result });
   } catch (err) { next(err); }
 });
-// ═══════════════════════════════════════════════════════════
+
 //  PrismDB — Módulo Ventas Activas
 //  Carga de bases · Catálogos · Campañas · Clientes inactivos
 //
@@ -1323,576 +1323,410 @@ JSON: {"segmentos":[{"nombre":"...","descripcion":"...","criterio":"...","tamañ
     res.json({ ok: true, base_id, total_contactos: base.total, segmentos });
   } catch (err) { next(err); }
 });
-<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>PrismDB — Enterprise Graph</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#0c0e14;--bg2:#13161f;--bg3:#1a1e2a;--bg4:#222638;
-  --border:#2a2f42;--border2:#363c55;
-  --accent:#6366f1;--accent2:#818cf8;
-  --green:#22c55e;--yellow:#eab308;--red:#ef4444;
-  --blue:#3b82f6;--purple:#a855f7;--orange:#f97316;
-  --text:#e2e8f0;--muted:#64748b;--muted2:#94a3b8;
-  --mono:'JetBrains Mono',monospace;--sans:'Inter',sans-serif;
-}
-body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+// ═══════════════════════════════════════════════════════════
+//  PrismDB — Enterprise Graph
+//  Relaciones entre entidades del sistema operativo
+//
+//  AGREGAR AL FINAL DE prismdb-backend.js
+//  (antes del error handler)
+//
+//  Entidades: cliente, vendedor, factura, conversacion,
+//             campana, pedido, pago, candidato, vacante,
+//             entrevista, deal
+//
+//  Relaciones: COMPRÓ, ASIGNADO_A, GENERÓ, PARTICIPÓ_EN,
+//              RECIBIÓ, APLICÓ_A, ENTREVISTADO_POR, etc.
+// ═══════════════════════════════════════════════════════════
 
-.topbar{display:flex;align-items:center;justify-content:space-between;padding:10px 20px;background:var(--bg2);border-bottom:1px solid var(--border);flex-shrink:0;gap:12px}
-.logo{font-family:var(--mono);font-weight:600;font-size:13px;white-space:nowrap}
-.logo span{color:var(--accent)}
-.search-box{flex:1;max-width:320px;position:relative}
-.search-box input{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:5px;color:var(--text);font-family:var(--mono);font-size:12px;padding:6px 10px 6px 30px;outline:none;transition:border-color .15s}
-.search-box input:focus{border-color:var(--accent)}
-.search-icon{position:absolute;left:9px;top:50%;transform:translateY(-50%);font-size:13px;color:var(--muted)}
-.topbar-right{display:flex;align-items:center;gap:8px}
-.btn{display:inline-flex;align-items:center;gap:5px;padding:6px 12px;border-radius:5px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid transparent;transition:all .15s;white-space:nowrap}
-.btn-ghost{background:var(--bg3);color:var(--muted2);border-color:var(--border)}
-.btn-ghost:hover{color:var(--text);border-color:var(--border2)}
-.btn-primary{background:var(--accent);color:#fff}
-.btn-primary:hover{background:var(--accent2)}
-.btn-green{background:rgba(34,197,94,.15);color:var(--green);border-color:rgba(34,197,94,.3)}
-.view-toggle{display:flex;background:var(--bg3);border:1px solid var(--border);border-radius:5px;overflow:hidden}
-.view-btn{padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;color:var(--muted);transition:all .15s}
-.view-btn.active{background:var(--accent);color:#fff}
+// ── SCHEMA DEL GRAFO en PostgreSQL ──────────────────────
+// Se crean las tablas al iniciar si no existen
 
-.main{display:flex;flex:1;overflow:hidden}
+async function initGraphTables() {
+  if (!db || memoryMode !== "postgresql") return;
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS graph_nodes (
+      id          TEXT PRIMARY KEY,
+      type        TEXT NOT NULL,
+      label       TEXT NOT NULL,
+      properties  JSONB NOT NULL DEFAULT '{}',
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ DEFAULT NOW()
+    );
 
-/* SIDEBAR */
-.sidebar{width:260px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;overflow:hidden}
-.sidebar-section{padding:12px;border-bottom:1px solid var(--border)}
-.sidebar-title{font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
-.filter-chips{display:flex;flex-wrap:wrap;gap:4px}
-.chip{padding:3px 8px;border-radius:3px;font-size:10px;font-weight:600;cursor:pointer;border:1px solid transparent;transition:all .15s;display:flex;align-items:center;gap:3px}
-.chip.active{border-color:currentColor;background:rgba(255,255,255,.08)}
-.chip:hover{opacity:.8}
+    CREATE TABLE IF NOT EXISTS graph_edges (
+      id          SERIAL PRIMARY KEY,
+      from_id     TEXT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
+      to_id       TEXT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
+      relation    TEXT NOT NULL,
+      weight      NUMERIC DEFAULT 1,
+      properties  JSONB NOT NULL DEFAULT '{}',
+      created_at  TIMESTAMPTZ DEFAULT NOW()
+    );
 
-.node-detail{flex:1;overflow-y:auto;padding:12px}
-.nd-empty{color:var(--muted);font-size:11px;text-align:center;padding:24px 12px;line-height:1.6}
-.nd-type{font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;margin-bottom:6px}
-.nd-label{font-size:16px;font-weight:700;color:var(--text);margin-bottom:12px;line-height:1.2}
-.nd-section{margin-bottom:14px}
-.nd-section-title{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
-.nd-prop{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-size:11px}
-.nd-prop:last-child{border-bottom:none}
-.nd-prop-key{color:var(--muted)}
-.nd-prop-val{color:var(--text);font-family:var(--mono);text-align:right;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.relation-item{display:flex;align-items:center;gap:6px;padding:6px;background:var(--bg3);border-radius:4px;margin-bottom:4px;cursor:pointer;transition:background .15s}
-.relation-item:hover{background:var(--bg4)}
-.rel-direction{font-size:10px;color:var(--muted);flex-shrink:0}
-.rel-type{font-size:10px;font-weight:600;padding:2px 5px;border-radius:3px;background:var(--bg4);color:var(--muted2);flex-shrink:0}
-.rel-target{font-size:11px;color:var(--text);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ai-insight{background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.2);border-radius:5px;padding:8px;font-size:11px;color:var(--accent2);line-height:1.5;margin-bottom:6px}
-
-/* GRAPH AREA */
-.graph-area{flex:1;position:relative;overflow:hidden}
-#graph-svg{width:100%;height:100%;cursor:grab}
-#graph-svg:active{cursor:grabbing}
-.graph-controls{position:absolute;bottom:16px;right:16px;display:flex;flex-direction:column;gap:4px}
-.ctrl-btn{width:32px;height:32px;background:var(--bg2);border:1px solid var(--border);border-radius:5px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--muted2);font-size:16px;transition:all .15s}
-.ctrl-btn:hover{border-color:var(--accent);color:var(--accent2)}
-.graph-stats{position:absolute;top:12px;left:12px;display:flex;gap:8px}
-.gstat{background:rgba(19,22,31,.9);border:1px solid var(--border);border-radius:4px;padding:4px 10px;font-size:10px;font-weight:600;color:var(--muted2)}
-.gstat span{color:var(--text);font-family:var(--mono)}
-
-/* TABLE VIEW */
-.table-view{flex:1;overflow-y:auto;padding:16px;display:none}
-.table-view.active{display:block}
-.tbl{width:100%;border-collapse:collapse}
-.tbl th{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:8px 10px;text-align:left;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg)}
-.tbl td{padding:9px 10px;border-bottom:1px solid var(--border);font-size:12px;color:var(--muted2)}
-.tbl tr:hover td{background:var(--bg2);cursor:pointer}
-.badge{display:inline-flex;align-items:center;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:600}
-
-/* ADD PANEL */
-.add-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:24px;width:480px;z-index:50;display:none;box-shadow:0 24px 48px rgba(0,0,0,.5)}
-.add-panel.open{display:block}
-.ap-title{font-size:14px;font-weight:700;color:var(--text);margin-bottom:16px;display:flex;justify-content:space-between;align-items:center}
-.ap-close{cursor:pointer;color:var(--muted);font-size:18px;transition:color .15s}
-.ap-close:hover{color:var(--text)}
-.form-group{margin-bottom:12px}
-label{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:4px}
-input,select{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:5px;color:var(--text);font-family:var(--mono);font-size:12px;padding:7px 10px;outline:none;transition:border-color .15s}
-input:focus,select:focus{border-color:var(--accent)}
-.ap-tabs{display:flex;gap:2px;margin-bottom:16px}
-.ap-tab{padding:6px 14px;font-size:11px;font-weight:600;cursor:pointer;border-radius:4px;color:var(--muted);transition:all .15s}
-.ap-tab.active{background:rgba(99,102,241,.15);color:var(--accent2)}
-.form-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-
-/* SPINNER */
-.spinner{width:14px;height:14px;border:2px solid rgba(255,255,255,.2);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-
-/* TOOLTIP */
-.tooltip{position:absolute;background:rgba(19,22,31,.95);border:1px solid var(--border);border-radius:5px;padding:8px 10px;font-size:11px;pointer-events:none;z-index:100;max-width:200px;display:none}
-</style>
-</head>
-<body>
-
-<div class="topbar">
-  <div class="logo">Prism<span>DB</span> · Enterprise Graph</div>
-  <div class="search-box">
-    <span class="search-icon">🔍</span>
-    <input type="text" id="search-input" placeholder="Buscar entidad..." oninput="searchGraph(this.value)"/>
-  </div>
-  <div class="topbar-right">
-    <div class="view-toggle">
-      <div class="view-btn active" onclick="setView('graph',this)">🕸️ Grafo</div>
-      <div class="view-btn" onclick="setView('table',this)">📋 Tabla</div>
-    </div>
-    <button class="btn btn-ghost" onclick="syncFromMemory()">🔄 Sincronizar</button>
-    <button class="btn btn-green" onclick="openAddPanel()">+ Agregar</button>
-  </div>
-</div>
-
-<div class="main">
-  <!-- SIDEBAR -->
-  <div class="sidebar">
-    <div class="sidebar-section">
-      <div class="sidebar-title">Filtrar por tipo</div>
-      <div class="filter-chips" id="filter-chips"></div>
-    </div>
-    <div class="sidebar-section">
-      <div class="sidebar-title">Estadísticas</div>
-      <div id="graph-stats-sidebar" style="font-size:11px;color:var(--muted)">Cargando...</div>
-    </div>
-    <div class="node-detail" id="node-detail">
-      <div class="nd-empty">Haz clic en un nodo para ver sus relaciones y análisis IA.</div>
-    </div>
-  </div>
-
-  <!-- GRAPH -->
-  <div class="graph-area" id="graph-area">
-    <svg id="graph-svg"></svg>
-    <div class="graph-stats" id="graph-stats-top"></div>
-    <div class="graph-controls">
-      <div class="ctrl-btn" onclick="zoomIn()" title="Acercar">+</div>
-      <div class="ctrl-btn" onclick="zoomOut()" title="Alejar">−</div>
-      <div class="ctrl-btn" onclick="resetZoom()" title="Resetear">⊙</div>
-    </div>
-    <div class="tooltip" id="tooltip"></div>
-  </div>
-
-  <!-- TABLE VIEW -->
-  <div class="table-view" id="table-view">
-    <div id="table-content"></div>
-  </div>
-</div>
-
-<!-- ADD PANEL -->
-<div class="add-panel" id="add-panel">
-  <div class="ap-title">
-    <span>Agregar al grafo</span>
-    <span class="ap-close" onclick="closeAddPanel()">×</span>
-  </div>
-  <div class="ap-tabs">
-    <div class="ap-tab active" onclick="switchApTab('node',this)">Nodo</div>
-    <div class="ap-tab" onclick="switchApTab('edge',this)">Relación</div>
-    <div class="ap-tab" onclick="switchApTab('bulk',this)">Masivo</div>
-  </div>
-
-  <div id="ap-node">
-    <div class="form-row">
-      <div class="form-group">
-        <label>ID único</label>
-        <input type="text" id="n-id" placeholder="cliente_001"/>
-      </div>
-      <div class="form-group">
-        <label>Tipo</label>
-        <select id="n-type">
-          <option value="cliente">👤 Cliente</option>
-          <option value="vendedor">💼 Vendedor</option>
-          <option value="factura">🧾 Factura</option>
-          <option value="conversacion">💬 Conversación</option>
-          <option value="campana">📣 Campaña</option>
-          <option value="pedido">📦 Pedido</option>
-          <option value="pago">💰 Pago</option>
-          <option value="candidato">🎓 Candidato</option>
-          <option value="vacante">📋 Vacante</option>
-          <option value="entrevista">🤝 Entrevista</option>
-          <option value="deal">🎯 Deal</option>
-          <option value="empresa">🏢 Empresa</option>
-        </select>
-      </div>
-    </div>
-    <div class="form-group">
-      <label>Nombre / Label</label>
-      <input type="text" id="n-label" placeholder="Ej: María González"/>
-    </div>
-    <div class="form-group">
-      <label>Propiedades (JSON opcional)</label>
-      <input type="text" id="n-props" placeholder='{"empresa":"ABC","ciudad":"Bogotá"}'/>
-    </div>
-    <button class="btn btn-primary" onclick="addNode()" style="width:100%">Crear nodo</button>
-  </div>
-
-  <div id="ap-edge" style="display:none">
-    <div class="form-group">
-      <label>Desde (ID del nodo origen)</label>
-      <input type="text" id="e-from" placeholder="cliente_001"/>
-    </div>
-    <div class="form-group">
-      <label>Relación</label>
-      <select id="e-relation">
-        <option value="COMPRO">Compró</option>
-        <option value="ASIGNADO_A">Asignado a</option>
-        <option value="GENERO">Generó</option>
-        <option value="PARTICIPO_EN">Participó en</option>
-        <option value="RECIBIO">Recibió</option>
-        <option value="APLICO_A">Aplicó a</option>
-        <option value="ENTREVISTADO_POR">Entrevistado por</option>
-        <option value="PAGO">Pagó</option>
-        <option value="TIENE_DEAL">Tiene deal</option>
-        <option value="PERTENECE_A">Pertenece a</option>
-        <option value="ENVIO_A">Envió a</option>
-        <option value="CONTIENE">Contiene</option>
-        <option value="SELECCIONADO_EN">Seleccionado en</option>
-      </select>
-    </div>
-    <div class="form-group">
-      <label>Hasta (ID del nodo destino)</label>
-      <input type="text" id="e-to" placeholder="vendedor_001"/>
-    </div>
-    <button class="btn btn-primary" onclick="addEdge()" style="width:100%">Crear relación</button>
-  </div>
-
-  <div id="ap-bulk" style="display:none">
-    <div style="font-size:11px;color:var(--muted);margin-bottom:12px">
-      Importa múltiples nodos y relaciones a la vez desde JSON.
-    </div>
-    <button class="btn btn-green" onclick="syncFromMemory(true)" style="width:100%;margin-bottom:8px">🔄 Sincronizar desde Memory Layer</button>
-    <div style="font-size:10px;color:var(--muted)">Convierte todos los contactos de memoria en nodos del grafo automáticamente.</div>
-  </div>
-</div>
-
-<script>
-const API = 'https://prismdb-backend-production.up.railway.app';
-let graphData = { nodes: [], edges: [] };
-let simulation, svg, g, zoomBehavior;
-let activeFilters = new Set();
-let selectedNode = null;
-let currentView = 'graph';
-
-// ── API ───────────────────────────────────────────────────
-async function api(path, method='GET', body=null) {
-  const opts = { method, headers:{'Content-Type':'application/json'} };
-  if (body) opts.body = JSON.stringify(body);
-  const r = await fetch(API + path, opts);
-  return r.json();
+    CREATE INDEX IF NOT EXISTS graph_edges_from ON graph_edges(from_id);
+    CREATE INDEX IF NOT EXISTS graph_edges_to   ON graph_edges(to_id);
+    CREATE INDEX IF NOT EXISTS graph_nodes_type ON graph_nodes(type);
+  `).catch(e => console.error("[GRAPH INIT]", e.message));
+  console.log("✅ Enterprise Graph tables ready");
 }
 
-function toast(msg) {
-  // Simple status message
-  console.log(msg);
+// Inicializar tablas al arrancar
+setTimeout(initGraphTables, 3000);
+
+// ── TIPOS DE NODOS ───────────────────────────────────────
+const NODE_TYPES = {
+  cliente:       { color: "#3b82f6", icon: "👤", label: "Cliente"      },
+  vendedor:      { color: "#22c55e", icon: "💼", label: "Vendedor"     },
+  factura:       { color: "#eab308", icon: "🧾", label: "Factura"      },
+  conversacion:  { color: "#a855f7", icon: "💬", label: "Conversación" },
+  campana:       { color: "#f97316", icon: "📣", label: "Campaña"      },
+  pedido:        { color: "#14b8a6", icon: "📦", label: "Pedido"       },
+  pago:          { color: "#22c55e", icon: "💰", label: "Pago"         },
+  candidato:     { color: "#6366f1", icon: "🎓", label: "Candidato"    },
+  vacante:       { color: "#ec4899", icon: "📋", label: "Vacante"      },
+  entrevista:    { color: "#8b5cf6", icon: "🤝", label: "Entrevista"   },
+  deal:          { color: "#ef4444", icon: "🎯", label: "Deal"         },
+  empresa:       { color: "#64748b", icon: "🏢", label: "Empresa"      },
+};
+
+// ── TIPOS DE RELACIONES ──────────────────────────────────
+const RELATION_TYPES = {
+  COMPRO:           { label: "Compró",          color: "#22c55e" },
+  ASIGNADO_A:       { label: "Asignado a",      color: "#3b82f6" },
+  GENERO:           { label: "Generó",           color: "#eab308" },
+  PARTICIPO_EN:     { label: "Participó en",    color: "#a855f7" },
+  RECIBIO:          { label: "Recibió",          color: "#f97316" },
+  APLICO_A:         { label: "Aplicó a",        color: "#6366f1" },
+  ENTREVISTADO_POR: { label: "Entrevistado por", color: "#8b5cf6" },
+  PAGO:             { label: "Pagó",            color: "#22c55e" },
+  TIENE_DEAL:       { label: "Tiene deal",      color: "#ef4444" },
+  PERTENECE_A:      { label: "Pertenece a",     color: "#64748b" },
+  ENVIO_A:          { label: "Envió a",         color: "#f97316" },
+  CONTIENE:         { label: "Contiene",        color: "#14b8a6" },
+  SELECCIONADO_EN:  { label: "Seleccionado en", color: "#ec4899" },
+};
+
+// ── HELPERS ──────────────────────────────────────────────
+async function upsertNode(id, type, label, properties = {}) {
+  if (!db) return;
+  await db.query(`
+    INSERT INTO graph_nodes (id, type, label, properties)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (id) DO UPDATE
+      SET label = $3, properties = graph_nodes.properties || $4, updated_at = NOW()
+  `, [id, type, label, properties]);
 }
 
-// ── LOAD GRAPH ────────────────────────────────────────────
-async function loadGraph() {
-  try {
-    const filter = activeFilters.size ? `?type=${[...activeFilters][0]}` : '';
-    const data = await api('/graph' + filter);
-    graphData = data;
-    renderFilterChips(data.node_types || {});
-    renderStatsTop(data.stats || {});
-    renderStatsSidebar(data.stats || {});
-    if (currentView === 'graph') renderD3Graph(data.nodes || [], data.edges || []);
-    else renderTable(data.nodes || []);
-  } catch(e) { console.error(e); }
-}
-
-// ── FILTER CHIPS ──────────────────────────────────────────
-function renderFilterChips(types) {
-  const container = document.getElementById('filter-chips');
-  container.innerHTML = Object.entries(types).map(([key, cfg]) => `
-    <div class="chip ${activeFilters.has(key)?'active':''}"
-      style="color:${cfg.color}"
-      onclick="toggleFilter('${key}')">
-      ${cfg.icon} ${cfg.label}
-    </div>`).join('');
-}
-
-function toggleFilter(type) {
-  if (activeFilters.has(type)) activeFilters.delete(type);
-  else { activeFilters.clear(); activeFilters.add(type); }
-  loadGraph();
-}
-
-// ── STATS ─────────────────────────────────────────────────
-function renderStatsTop(stats) {
-  document.getElementById('graph-stats-top').innerHTML = `
-    <div class="gstat">Nodos: <span>${stats.total_nodes||0}</span></div>
-    <div class="gstat">Relaciones: <span>${stats.total_edges||0}</span></div>
-    <div class="gstat">Tipos: <span>${stats.entity_types||0}</span></div>`;
-}
-
-function renderStatsSidebar(stats) {
-  document.getElementById('graph-stats-sidebar').innerHTML = `
-    <div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border)"><span>Total nodos</span><span style="font-family:var(--mono);color:var(--text)">${stats.total_nodes||0}</span></div>
-    <div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border)"><span>Relaciones</span><span style="font-family:var(--mono);color:var(--text)">${stats.total_edges||0}</span></div>
-    <div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border)"><span>Tipos entidad</span><span style="font-family:var(--mono);color:var(--text)">${stats.entity_types||0}</span></div>
-    <div style="display:flex;justify-content:space-between;padding:3px 0"><span>Tipos relación</span><span style="font-family:var(--mono);color:var(--text)">${stats.relation_types||0}</span></div>`;
-}
-
-// ── D3 GRAPH ──────────────────────────────────────────────
-function renderD3Graph(nodes, edges) {
-  const area = document.getElementById('graph-area');
-  const W = area.clientWidth, H = area.clientHeight;
-
-  d3.select('#graph-svg').selectAll('*').remove();
-  svg = d3.select('#graph-svg').attr('viewBox', `0 0 ${W} ${H}`);
-
-  zoomBehavior = d3.zoom().scaleExtent([0.1, 4]).on('zoom', e => g.attr('transform', e.transform));
-  svg.call(zoomBehavior);
-  g = svg.append('g');
-
-  if (!nodes.length) {
-    svg.append('text').attr('x', W/2).attr('y', H/2)
-      .attr('text-anchor','middle').attr('fill','#64748b').attr('font-size','14')
-      .text('Sin nodos aún. Sincroniza desde Memory Layer o agrega nodos manualmente.');
-    return;
+async function upsertEdge(fromId, toId, relation, properties = {}, weight = 1) {
+  if (!db) return;
+  // Evitar duplicados de la misma relación entre los mismos nodos
+  const existing = await db.query(
+    "SELECT id FROM graph_edges WHERE from_id=$1 AND to_id=$2 AND relation=$3",
+    [fromId, toId, relation]
+  );
+  if (existing.rows.length) {
+    await db.query(
+      "UPDATE graph_edges SET weight = weight + $1, properties = properties || $2 WHERE from_id=$3 AND to_id=$4 AND relation=$5",
+      [weight, properties, fromId, toId, relation]
+    );
+  } else {
+    await db.query(
+      "INSERT INTO graph_edges (from_id, to_id, relation, weight, properties) VALUES ($1,$2,$3,$4,$5)",
+      [fromId, toId, relation, weight, properties]
+    );
   }
+}
 
-  const nodeMap = new Map(nodes.map(n => [n.id, n]));
-  const validEdges = edges.filter(e => nodeMap.has(e.from_id) && nodeMap.has(e.to_id));
+// ══════════════════════════════════════════════════════════
+//  RUTAS — NODOS
+// ══════════════════════════════════════════════════════════
 
-  const nodeTypes = graphData.node_types || {};
-  const color = d => (nodeTypes[d.type]?.color) || '#64748b';
+// POST /graph/node — crear o actualizar nodo
+app.post("/graph/node", async (req, res, next) => {
+  try {
+    const { id, type, label, properties = {} } = req.body;
+    if (!id || !type || !label) return res.status(400).json({ error: "id, type y label requeridos" });
+    if (!NODE_TYPES[type]) return res.status(400).json({ error: `Tipo inválido. Válidos: ${Object.keys(NODE_TYPES).join(", ")}` });
 
-  // Simulation
-  simulation = d3.forceSimulation(nodes)
-    .force('link', d3.forceLink(validEdges).id(d=>d.id).distance(90).strength(0.5))
-    .force('charge', d3.forceManyBody().strength(-200))
-    .force('center', d3.forceCenter(W/2, H/2))
-    .force('collision', d3.forceCollide(28));
+    await upsertNode(id, type, label, properties);
+    res.status(201).json({ ok: true, id, type, label, properties });
+  } catch (err) { next(err); }
+});
 
-  // Defs — arrowhead
-  svg.append('defs').append('marker')
-    .attr('id','arrow').attr('viewBox','0 -4 8 8').attr('refX',20).attr('refY',0)
-    .attr('markerWidth',6).attr('markerHeight',6).attr('orient','auto')
-    .append('path').attr('d','M0,-4L8,0L0,4').attr('fill','#3a4055');
+// GET /graph/nodes — todos los nodos (con filtro opcional por tipo)
+app.get("/graph/nodes", async (req, res, next) => {
+  try {
+    const { type, search, limit = 100 } = req.query;
+    if (!db || memoryMode !== "postgresql") return res.json({ nodes: [], types: NODE_TYPES });
 
-  // Edges
-  const link = g.append('g').selectAll('line').data(validEdges).join('line')
-    .attr('stroke','#2a2f42').attr('stroke-width', d => Math.min(1+d.weight*.3,3))
-    .attr('marker-end','url(#arrow)');
+    let query = "SELECT * FROM graph_nodes WHERE 1=1";
+    const params = [];
+    if (type) { params.push(type); query += ` AND type = $${params.length}`; }
+    if (search) { params.push(`%${search}%`); query += ` AND label ILIKE $${params.length}`; }
+    params.push(parseInt(limit));
+    query += ` ORDER BY updated_at DESC LIMIT $${params.length}`;
 
-  // Edge labels
-  const edgeLabel = g.append('g').selectAll('text').data(validEdges).join('text')
-    .attr('fill','#3a4055').attr('font-size','8').attr('text-anchor','middle')
-    .attr('font-family','Inter,sans-serif')
-    .text(d => {
-      const types = graphData.relation_types || {};
-      return types[d.relation]?.label || d.relation;
+    const result = await db.query(query, params);
+    res.json({ nodes: result.rows, total: result.rowCount, types: NODE_TYPES });
+  } catch (err) { next(err); }
+});
+
+// GET /graph/node/:id — nodo con todas sus relaciones
+app.get("/graph/node/:id", async (req, res, next) => {
+  try {
+    if (!db || memoryMode !== "postgresql") return res.status(503).json({ error: "Requiere PostgreSQL" });
+
+    const { id } = req.params;
+    const [node, outgoing, incoming] = await Promise.all([
+      db.query("SELECT * FROM graph_nodes WHERE id = $1", [id]),
+      db.query(`
+        SELECT e.*, n.type as to_type, n.label as to_label, n.properties as to_properties
+        FROM graph_edges e JOIN graph_nodes n ON e.to_id = n.id
+        WHERE e.from_id = $1 ORDER BY e.created_at DESC
+      `, [id]),
+      db.query(`
+        SELECT e.*, n.type as from_type, n.label as from_label, n.properties as from_properties
+        FROM graph_edges e JOIN graph_nodes n ON e.from_id = n.id
+        WHERE e.to_id = $1 ORDER BY e.created_at DESC
+      `, [id]),
+    ]);
+
+    if (!node.rows.length) return res.status(404).json({ error: "Nodo no encontrado" });
+
+    // Análisis IA del nodo
+    const analysis = await claudeChat(
+      "Analista de relaciones empresariales. SOLO JSON.",
+      `Analiza este nodo y sus relaciones. Devuelve insights accionables.
+Nodo: ${JSON.stringify(node.rows[0])}
+Relaciones salientes: ${JSON.stringify(outgoing.rows.slice(0,10))}
+Relaciones entrantes: ${JSON.stringify(incoming.rows.slice(0,10))}
+
+JSON: {"resumen":"2 oraciones","insights":["insight 1","insight 2"],"riesgo":"alto|medio|bajo|ninguno","accion_recomendada":"...","valor_estimado":0}`
+    ).catch(() => "{}");
+
+    let analysisObj = {};
+    try { analysisObj = JSON.parse(analysis.replace(/```json|```/g, "").trim()); } catch {}
+
+    res.json({
+      node: node.rows[0],
+      outgoing: outgoing.rows,
+      incoming: incoming.rows,
+      total_relations: outgoing.rowCount + incoming.rowCount,
+      analysis: analysisObj,
     });
+  } catch (err) { next(err); }
+});
 
-  // Nodes
-  const node = g.append('g').selectAll('g').data(nodes).join('g')
-    .attr('cursor','pointer')
-    .call(d3.drag()
-      .on('start', (e,d) => { if(!e.active) simulation.alphaTarget(0.3).restart(); d.fx=d.x;d.fy=d.y; })
-      .on('drag',  (e,d) => { d.fx=e.x;d.fy=e.y; })
-      .on('end',   (e,d) => { if(!e.active) simulation.alphaTarget(0); d.fx=null;d.fy=null; })
-    )
-    .on('click', (e,d) => { e.stopPropagation(); selectNodeDetail(d); })
-    .on('mouseover', (e,d) => showTooltip(e,d))
-    .on('mouseout',  () => hideTooltip());
+// ══════════════════════════════════════════════════════════
+//  RUTAS — RELACIONES (EDGES)
+// ══════════════════════════════════════════════════════════
 
-  node.append('circle').attr('r',14).attr('fill', d => color(d)+'33').attr('stroke', d=>color(d)).attr('stroke-width',1.5);
-  node.append('text').attr('text-anchor','middle').attr('dominant-baseline','central').attr('font-size','12')
-    .text(d => (graphData.node_types?.[d.type]?.icon) || '●');
-  node.append('text').attr('y',22).attr('text-anchor','middle').attr('fill','#94a3b8').attr('font-size','9')
-    .attr('font-family','Inter,sans-serif')
-    .text(d => d.label.length>14 ? d.label.slice(0,12)+'…' : d.label);
-
-  simulation.on('tick', () => {
-    link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y).attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
-    edgeLabel.attr('x',d=>(d.source.x+d.target.x)/2).attr('y',d=>(d.source.y+d.target.y)/2);
-    node.attr('transform',d=>`translate(${d.x},${d.y})`);
-  });
-
-  svg.on('click', () => clearNodeDetail());
-}
-
-// ── TOOLTIP ───────────────────────────────────────────────
-function showTooltip(e, d) {
-  const t = document.getElementById('tooltip');
-  const types = graphData.node_types || {};
-  t.innerHTML = `<strong>${d.label}</strong><br/><span style="color:#64748b">${types[d.type]?.label||d.type}</span>`;
-  t.style.display = 'block';
-  t.style.left = (e.offsetX+12)+'px';
-  t.style.top = (e.offsetY-10)+'px';
-}
-function hideTooltip() { document.getElementById('tooltip').style.display='none'; }
-
-// ── NODE DETAIL ───────────────────────────────────────────
-async function selectNodeDetail(d) {
-  selectedNode = d;
-  const detail = document.getElementById('node-detail');
-  const types = graphData.node_types || {};
-  const cfg = types[d.type] || {};
-  detail.innerHTML = `<div style="text-align:center;padding:8px 0 4px"><div style="font-size:28px">${cfg.icon||'●'}</div></div>
-    <div class="nd-type" style="color:${cfg.color||'#64748b'};text-align:center">${cfg.label||d.type}</div>
-    <div class="nd-label" style="text-align:center">${d.label}</div>
-    <div style="text-align:center;margin-bottom:12px"><span style="font-family:var(--mono);font-size:10px;color:var(--muted)">${d.id}</span></div>
-    <div style="text-align:center;margin-bottom:16px"><div class="spinner" style="margin:0 auto;border-top-color:${cfg.color||'var(--accent)'}"></div></div>`;
-
+// POST /graph/edge — crear relación entre nodos
+app.post("/graph/edge", async (req, res, next) => {
   try {
-    const data = await api('/graph/node/' + encodeURIComponent(d.id));
-    const props = data.node?.properties || {};
-    const ai = data.analysis || {};
+    const { from_id, to_id, relation, properties = {}, weight = 1 } = req.body;
+    if (!from_id || !to_id || !relation) return res.status(400).json({ error: "from_id, to_id y relation requeridos" });
 
-    let html = `<div style="text-align:center;padding:8px 0 4px"><div style="font-size:28px">${cfg.icon||'●'}</div></div>
-      <div class="nd-type" style="color:${cfg.color||'#64748b'};text-align:center">${cfg.label||d.type}</div>
-      <div class="nd-label" style="text-align:center">${d.label}</div>`;
+    // Auto-crear nodos si no existen (con tipo inferido del ID)
+    if (db) {
+      const fromExists = await db.query("SELECT id FROM graph_nodes WHERE id=$1", [from_id]);
+      if (!fromExists.rows.length) await upsertNode(from_id, "cliente", from_id, {});
+      const toExists = await db.query("SELECT id FROM graph_nodes WHERE id=$1", [to_id]);
+      if (!toExists.rows.length) await upsertNode(to_id, "cliente", to_id, {});
+    }
 
-    if (ai.resumen) html += `<div class="ai-insight">🤖 ${ai.resumen}</div>`;
-    if (ai.accion_recomendada) html += `<div class="ai-insight" style="background:rgba(34,197,94,.08);border-color:rgba(34,197,94,.2);color:#4ade80">→ ${ai.accion_recomendada}</div>`;
+    await upsertEdge(from_id, to_id, relation, properties, weight);
+    res.status(201).json({ ok: true, from_id, to_id, relation, weight });
+  } catch (err) { next(err); }
+});
 
-    if (Object.keys(props).filter(k=>props[k]).length) {
-      html += `<div class="nd-section"><div class="nd-section-title">Propiedades</div>`;
-      Object.entries(props).filter(([k,v])=>v).forEach(([k,v])=>{
-        html += `<div class="nd-prop"><span class="nd-prop-key">${k}</span><span class="nd-prop-val">${v}</span></div>`;
+// GET /graph/edges — todas las relaciones
+app.get("/graph/edges", async (req, res, next) => {
+  try {
+    if (!db || memoryMode !== "postgresql") return res.json({ edges: [], relations: RELATION_TYPES });
+    const { relation, limit = 200 } = req.query;
+    let query = "SELECT e.*, fn.label as from_label, fn.type as from_type, tn.label as to_label, tn.type as to_type FROM graph_edges e JOIN graph_nodes fn ON e.from_id=fn.id JOIN graph_nodes tn ON e.to_id=tn.id WHERE 1=1";
+    const params = [];
+    if (relation) { params.push(relation); query += ` AND e.relation=$${params.length}`; }
+    params.push(parseInt(limit));
+    query += ` ORDER BY e.created_at DESC LIMIT $${params.length}`;
+    const result = await db.query(query, params);
+    res.json({ edges: result.rows, total: result.rowCount, relations: RELATION_TYPES });
+  } catch (err) { next(err); }
+});
+
+// ══════════════════════════════════════════════════════════
+//  RUTAS — GRAFO COMPLETO
+// ══════════════════════════════════════════════════════════
+
+// GET /graph — grafo completo para visualización
+app.get("/graph", async (req, res, next) => {
+  try {
+    if (!db || memoryMode !== "postgresql") {
+      return res.json({ nodes: [], edges: [], stats: {}, node_types: NODE_TYPES, relation_types: RELATION_TYPES });
+    }
+
+    const { limit_nodes = 150, type } = req.query;
+    let nodeQuery = "SELECT * FROM graph_nodes";
+    const params = [];
+    if (type) { params.push(type); nodeQuery += " WHERE type=$1"; }
+    params.push(parseInt(limit_nodes));
+    nodeQuery += ` ORDER BY updated_at DESC LIMIT $${params.length}`;
+
+    const [nodes, edges, stats] = await Promise.all([
+      db.query(nodeQuery, params),
+      db.query(`
+        SELECT e.*, fn.type as from_type, tn.type as to_type
+        FROM graph_edges e
+        JOIN graph_nodes fn ON e.from_id=fn.id
+        JOIN graph_nodes tn ON e.to_id=tn.id
+        ORDER BY e.weight DESC LIMIT 500
+      `),
+      db.query(`
+        SELECT
+          (SELECT COUNT(*) FROM graph_nodes) as total_nodes,
+          (SELECT COUNT(*) FROM graph_edges) as total_edges,
+          (SELECT COUNT(DISTINCT type) FROM graph_nodes) as entity_types,
+          (SELECT COUNT(DISTINCT relation) FROM graph_edges) as relation_types
+      `),
+    ]);
+
+    res.json({
+      nodes: nodes.rows,
+      edges: edges.rows,
+      stats: stats.rows[0],
+      node_types: NODE_TYPES,
+      relation_types: RELATION_TYPES,
+    });
+  } catch (err) { next(err); }
+});
+
+// POST /graph/search — búsqueda semántica en el grafo con IA
+app.post("/graph/search", async (req, res, next) => {
+  try {
+    const { query, limit = 20 } = req.body;
+    if (!query) return res.status(400).json({ error: "query requerido" });
+    if (!db || memoryMode !== "postgresql") return res.json({ results: [] });
+
+    // Búsqueda en nodos
+    const nodes = await db.query(`
+      SELECT n.*, COUNT(e.id) as degree
+      FROM graph_nodes n
+      LEFT JOIN graph_edges e ON n.id=e.from_id OR n.id=e.to_id
+      WHERE n.label ILIKE $1 OR n.properties::text ILIKE $1
+      GROUP BY n.id ORDER BY degree DESC LIMIT $2
+    `, [`%${query}%`, parseInt(limit)]);
+
+    // IA interpreta la búsqueda
+    if (nodes.rows.length) {
+      const interpretation = await claudeChat(
+        "Analista de grafos empresariales. Interpreta resultados de búsqueda. SOLO JSON.",
+        `Query: "${query}"
+Resultados encontrados: ${JSON.stringify(nodes.rows.slice(0,5))}
+JSON: {"interpretacion":"qué encontró","patron_detectado":"...","sugerencia":"qué explorar siguiente"}`
+      ).catch(() => "{}");
+      let interp = {};
+      try { interp = JSON.parse(interpretation.replace(/```json|```/g, "").trim()); } catch {}
+      return res.json({ results: nodes.rows, total: nodes.rowCount, ai_interpretation: interp });
+    }
+
+    res.json({ results: [], total: 0, message: "Sin resultados para esa búsqueda" });
+  } catch (err) { next(err); }
+});
+
+// POST /graph/sync — sincronizar memoria existente al grafo
+app.post("/graph/sync", async (req, res, next) => {
+  try {
+    if (!db || memoryMode !== "postgresql") return res.status(503).json({ error: "Requiere PostgreSQL" });
+
+    const memory = await db.query("SELECT * FROM memory LIMIT 200");
+    let created = 0;
+
+    for (const row of memory.rows) {
+      const data = row.data || {};
+      const type = row.entity_type === "candidate" ? "candidato"
+        : row.entity_type === "deal" ? "deal"
+        : row.entity_type === "activa_contact" ? "cliente"
+        : "cliente";
+
+      const label = data.nombre || data.name || row.entity_id;
+
+      await upsertNode(row.entity_id, type, label, {
+        telefono: data.telefono,
+        empresa: data.empresa,
+        ciudad: data.ciudad,
+        stage: data.stage || data.talent_stage,
+        last_agent: data.last_agent,
+        revenue: data.expected_revenue,
       });
-      html += `</div>`;
+      created++;
+
+      // Crear relación con vendedor/agente si existe
+      if (data.last_agent) {
+        await upsertNode(`agent_${data.last_agent}`, "vendedor", `Agente ${data.last_agent.toUpperCase()}`, { type: "ai_agent" });
+        await upsertEdge(row.entity_id, `agent_${data.last_agent}`, "ASIGNADO_A", { via: "memory_sync" });
+      }
+
+      // Crear relación con empresa si existe
+      if (data.empresa) {
+        const empresaId = `emp_${data.empresa.toLowerCase().replace(/\s+/g, '_').slice(0,30)}`;
+        await upsertNode(empresaId, "empresa", data.empresa, {});
+        await upsertEdge(row.entity_id, empresaId, "PERTENECE_A", {});
+      }
     }
 
-    const allRels = [
-      ...( data.outgoing||[]).map(r=>({...r,dir:'out'})),
-      ...( data.incoming||[]).map(r=>({...r,dir:'in'})),
-    ];
+    res.json({ ok: true, synced: created, message: `${created} entidades sincronizadas al grafo` });
+  } catch (err) { next(err); }
+});
 
-    if (allRels.length) {
-      const relTypes = graphData.relation_types || {};
-      html += `<div class="nd-section"><div class="nd-section-title">${allRels.length} Relaciones</div>`;
-      allRels.slice(0,12).forEach(r=>{
-        const rLabel = relTypes[r.relation]?.label || r.relation;
-        const target = r.dir==='out' ? (r.to_label||r.to_id) : (r.from_label||r.from_id);
-        const targetId = r.dir==='out' ? r.to_id : r.from_id;
-        html += `<div class="relation-item" onclick="jumpToNode('${targetId}')">
-          <span class="rel-direction">${r.dir==='out'?'→':'←'}</span>
-          <span class="rel-type">${rLabel}</span>
-          <span class="rel-target">${target}</span>
-        </div>`;
-      });
-      if (allRels.length > 12) html += `<div style="font-size:10px;color:var(--muted);text-align:center;padding:6px">+${allRels.length-12} más</div>`;
-      html += `</div>`;
+// GET /graph/stats — estadísticas del grafo
+app.get("/graph/stats", async (req, res, next) => {
+  try {
+    if (!db || memoryMode !== "postgresql") return res.json({ stats: {} });
+
+    const [counts, topNodes, topRelations] = await Promise.all([
+      db.query(`
+        SELECT type, COUNT(*) as count FROM graph_nodes GROUP BY type ORDER BY count DESC
+      `),
+      db.query(`
+        SELECT n.id, n.label, n.type, COUNT(e.id) as connections
+        FROM graph_nodes n LEFT JOIN graph_edges e ON n.id=e.from_id OR n.id=e.to_id
+        GROUP BY n.id ORDER BY connections DESC LIMIT 10
+      `),
+      db.query(`
+        SELECT relation, COUNT(*) as count FROM graph_edges GROUP BY relation ORDER BY count DESC
+      `),
+    ]);
+
+    res.json({
+      node_counts: counts.rows,
+      top_connected: topNodes.rows,
+      top_relations: topRelations.rows,
+    });
+  } catch (err) { next(err); }
+});
+
+// POST /graph/bulk — cargar múltiples nodos y relaciones a la vez
+app.post("/graph/bulk", async (req, res, next) => {
+  try {
+    const { nodes = [], edges = [] } = req.body;
+    let n = 0, e = 0;
+    for (const node of nodes) {
+      if (node.id && node.type && node.label) {
+        await upsertNode(node.id, node.type, node.label, node.properties || {});
+        n++;
+      }
     }
-
-    detail.innerHTML = html;
-  } catch(e) {
-    detail.innerHTML += `<div style="color:var(--muted);font-size:11px;text-align:center">Error cargando detalle</div>`;
-  }
-}
-
-function clearNodeDetail() {
-  selectedNode = null;
-  document.getElementById('node-detail').innerHTML = '<div class="nd-empty">Haz clic en un nodo para ver sus relaciones y análisis IA.</div>';
-}
-
-function jumpToNode(id) {
-  const node = graphData.nodes.find(n=>n.id===id);
-  if (node) selectNodeDetail(node);
-}
-
-// ── TABLE VIEW ────────────────────────────────────────────
-function renderTable(nodes) {
-  const types = graphData.node_types || {};
-  document.getElementById('table-content').innerHTML = nodes.length ? `
-    <table class="tbl">
-      <thead><tr><th>Tipo</th><th>Label</th><th>ID</th><th>Empresa</th><th>Stage</th><th>Actualizado</th></tr></thead>
-      <tbody>${nodes.map(n=>{
-        const cfg = types[n.type]||{};
-        const p = n.properties||{};
-        return `<tr onclick="selectNodeDetail(${JSON.stringify(n).replace(/"/g,'&quot;')})">
-          <td><span style="color:${cfg.color||'#64748b'}">${cfg.icon||''} ${cfg.label||n.type}</span></td>
-          <td style="color:var(--text);font-weight:500">${n.label}</td>
-          <td style="font-family:var(--mono);font-size:10px;color:var(--muted)">${n.id}</td>
-          <td>${p.empresa||'—'}</td>
-          <td>${p.stage?`<span class="badge" style="background:rgba(99,102,241,.15);color:var(--accent2)">${p.stage}</span>`:'—'}</td>
-          <td style="color:var(--muted);font-size:11px">${new Date(n.updated_at).toLocaleDateString('es-CO')}</td>
-        </tr>`;
-      }).join('')}</tbody>
-    </table>` : '<div style="color:var(--muted);text-align:center;padding:48px;font-size:13px">Sin nodos en el grafo. Sincroniza desde Memory Layer.</div>';
-}
-
-// ── SEARCH ────────────────────────────────────────────────
-let searchTimer;
-async function searchGraph(q) {
-  clearTimeout(searchTimer);
-  if (!q.trim()) { loadGraph(); return; }
-  searchTimer = setTimeout(async () => {
-    const data = await api('/graph/search', 'POST', { query: q });
-    if (data.results) {
-      if (currentView === 'graph') renderD3Graph(data.results, graphData.edges||[]);
-      else renderTable(data.results);
+    for (const edge of edges) {
+      if (edge.from_id && edge.to_id && edge.relation) {
+        await upsertEdge(edge.from_id, edge.to_id, edge.relation, edge.properties || {}, edge.weight || 1);
+        e++;
+      }
     }
-  }, 400);
-}
+    res.json({ ok: true, nodes_created: n, edges_created: e });
+  } catch (err) { next(err); }
+});
 
-// ── ZOOM ──────────────────────────────────────────────────
-function zoomIn()    { svg?.transition().call(zoomBehavior.scaleBy, 1.4); }
-function zoomOut()   { svg?.transition().call(zoomBehavior.scaleBy, 0.7); }
-function resetZoom() { svg?.transition().call(zoomBehavior.transform, d3.zoomIdentity.translate(0,0).scale(1)); }
-
-// ── VIEW TOGGLE ───────────────────────────────────────────
-function setView(view, btn) {
-  currentView = view;
-  document.querySelectorAll('.view-btn').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
-  document.getElementById('graph-area').style.display = view==='graph' ? 'block' : 'none';
-  const tv = document.getElementById('table-view');
-  if (view==='table') { tv.classList.add('active'); renderTable(graphData.nodes||[]); }
-  else tv.classList.remove('active');
-}
-
-// ── ADD PANEL ─────────────────────────────────────────────
-function openAddPanel()  { document.getElementById('add-panel').classList.add('open'); }
-function closeAddPanel() { document.getElementById('add-panel').classList.remove('open'); }
-function switchApTab(tab, btn) {
-  document.querySelectorAll('.ap-tab').forEach(b=>b.classList.remove('active')); btn.classList.add('active');
-  ['node','edge','bulk'].forEach(t => document.getElementById('ap-'+t).style.display = t===tab?'block':'none');
-}
-
-async function addNode() {
-  const id = document.getElementById('n-id').value.trim();
-  const type = document.getElementById('n-type').value;
-  const label = document.getElementById('n-label').value.trim();
-  let props = {};
-  try { if(document.getElementById('n-props').value) props = JSON.parse(document.getElementById('n-props').value); } catch {}
-  if (!id||!label) return alert('ID y Label son requeridos');
-  await api('/graph/node','POST',{id,type,label,properties:props});
-  closeAddPanel(); loadGraph();
-}
-
-async function addEdge() {
-  const from_id = document.getElementById('e-from').value.trim();
-  const to_id = document.getElementById('e-to').value.trim();
-  const relation = document.getElementById('e-relation').value;
-  if (!from_id||!to_id) return alert('from_id y to_id requeridos');
-  await api('/graph/edge','POST',{from_id,to_id,relation});
-  closeAddPanel(); loadGraph();
-}
-
-async function syncFromMemory(fromPanel=false) {
-  const r = await api('/graph/sync','POST',{});
-  alert(`✓ ${r.message}`);
-  if (fromPanel) closeAddPanel();
-  loadGraph();
-}
-
-// ── INIT ──────────────────────────────────────────────────
-loadGraph();
-window.addEventListener('resize', () => { if(currentView==='graph') renderD3Graph(graphData.nodes||[], graphData.edges||[]); });
-</script>
-</body>
-</html>
 // ── Error handler ─────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error("[ERROR]", err.message);
@@ -1901,6 +1735,6 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, () => {
   console.log(`✅ PrismDB v2.1 corriendo en http://localhost:${PORT}`);
-  console.log(`   Memory: ${memoryMode} | AI Router: activo | Event Bus: iniciando...`);
-  console.log(`   Módulos: SDR · Revenue · Ventas Activas · Talent · Finance`);
+  console.log(`   Memory: ${memoryMode} | AI Router activo | Event Bus iniciando...`);
+  console.log(`   Módulos: SDR · Revenue · Ventas Activas · Talent · Finance · Enterprise Graph`);
 });
