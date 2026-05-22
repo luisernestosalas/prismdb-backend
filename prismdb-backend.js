@@ -489,26 +489,56 @@ app.post("/webhook/twilio", express.urlencoded({ extended: false }), async (req,
     // 2. Claude decide qué agente actúa
     let agent = "sdr";
     try {
-      const decision = await claudeChat(
-        `Eres el router de PrismDB. Responde SOLO con JSON válido, sin texto adicional:\n{"agent":"sdr","reason":"..."}\nOpciones: sdr=prospección, revenue=ventas/compra, talent=empleo, none=irrelevante.`,
-        `Mensaje: "${Body}"\nHistorial: ${JSON.stringify(memory)}`
-      );
-      const cleaned = (decision || "").replace(/\`\`\`json|\`\`\`/g, "").trim();
-      const match = cleaned.match(/\{[^}]+\}/);
-      if (match) {
-        const parsed = JSON.parse(match[0]);
-        agent = parsed.agent || "sdr";
-      }
-    } catch (parseErr) {
-      console.log("[WEBHOOK] parse fallback → agente sdr");
+      const routerRes = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01"
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 100,
+          messages: [{
+            role: "user",
+            content: "Clasifica este mensaje de WhatsApp para PrismDB. Responde SOLO el JSON: {agent} donde agent es: sdr (interes/prospecto), revenue (compra/precio/plan), talent (empleo), none (irrelevante).\n\nMensaje: " + Body
+          }]
+        })
+      });
+      const routerData = await routerRes.json();
+      const routerText = routerData.content?.[0]?.text || "";
+      const match = routerText.match(/"agent"\s*:\s*"(\w+)"/);
+      if (match) agent = match[1];
+      console.log("[WEBHOOK] Router decision:", agent, "| Text:", routerText.slice(0,60));
+    } catch (routerErr) {
+      console.log("[WEBHOOK] Router fallback sdr:", routerErr.message);
     }
 
     // 3. Agente genera respuesta
     if (agent !== "none") {
-      const agentResponse = await claudeChat(
-        `Agente ${agent.toUpperCase()} de PrismDB. Responde por WhatsApp. Máx 160 chars. Directo y personalizado.`,
-        `Mensaje: "${Body}"\nHistorial: ${JSON.stringify(memory)}\nDevuelve SOLO el mensaje a enviar, sin JSON.`
-      );
+      let agentResponse = "";
+      try {
+        const agentRes = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": process.env.ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 200,
+            system: "Eres el agente " + agent.toUpperCase() + " de PrismDB, el Sistema Operativo Empresarial para LATAM. Responde mensajes de WhatsApp de forma cálida, directa y personalizada. Máximo 160 caracteres. Solo el mensaje, sin explicaciones.",
+            messages: [{ role: "user", content: "Mensaje recibido: " + Body + "\nContexto del contacto: " + JSON.stringify(memory) + "\nGenera el mensaje de respuesta." }]
+          })
+        });
+        const agentData = await agentRes.json();
+        agentResponse = agentData.content?.[0]?.text || "";
+        console.log("[WEBHOOK] Agent " + agent + " response:", agentResponse.slice(0,80));
+      } catch(agentErr) {
+        console.log("[WEBHOOK] Agent error:", agentErr.message);
+        agentResponse = "Hola! Gracias por escribirnos. Un asesor de PrismDB te contactará pronto.";
+      }
 
       // 4. Enviar respuesta por WhatsApp
       if (agentResponse.trim()) {
