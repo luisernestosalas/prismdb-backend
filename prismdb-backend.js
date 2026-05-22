@@ -103,14 +103,24 @@ async function sendWhatsApp(to, message) {
   return await res.json();
 }
 
-async function claudeChat(system, userContent, model = "claude-haiku-4-5-20251001", maxTokens = 500) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({ model, max_tokens: maxTokens, system, messages: [{ role: "user", content: userContent }] }),
-  });
-  const data = await res.json();
-  return data.content?.[0]?.text || "";
+async function claudeChat(system, userContent, model = "gemini-2.0-flash", maxTokens = 500) {
+  try {
+    const geminiKey = process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY;
+    const prompt = system ? system + "\n\n" + userContent : userContent;
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: maxTokens, temperature: 0.7 }
+      }),
+    });
+    const data = await res.json();
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  } catch(e) {
+    console.error("[GEMINI ERROR]", e.message);
+    return "";
+  }
 }
 
 async function logEvent(type, entityId, payload) {
@@ -489,24 +499,17 @@ app.post("/webhook/twilio", express.urlencoded({ extended: false }), async (req,
     // 2. Claude decide qué agente actúa
     let agent = "sdr";
     try {
-      const routerRes = await fetch("https://api.anthropic.com/v1/messages", {
+      const geminiKey = process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY;
+      const routerRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": process.env.ANTHROPIC_API_KEY,
-          "anthropic-version": "2023-06-01"
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "claude-haiku-4-5-20251001",
-          max_tokens: 100,
-          messages: [{
-            role: "user",
-            content: "Clasifica este mensaje de WhatsApp para PrismDB. Responde SOLO el JSON: {agent} donde agent es: sdr (interes/prospecto), revenue (compra/precio/plan), talent (empleo), none (irrelevante).\n\nMensaje: " + Body
-          }]
+          contents: [{ parts: [{ text: "Clasifica este mensaje de WhatsApp para PrismDB. Responde SOLO el JSON: {agent} donde agent es: sdr (interes/prospecto), revenue (compra/precio/plan), talent (empleo), none (irrelevante).\n\nMensaje: " + Body }] }],
+          generationConfig: { maxOutputTokens: 100, temperature: 0.1 }
         })
       });
       const routerData = await routerRes.json();
-      const routerText = routerData.content?.[0]?.text || "";
+      const routerText = routerData.candidates?.[0]?.content?.parts?.[0]?.text || "";
       const match = routerText.match(/"agent"\s*:\s*"(\w+)"/);
       if (match) agent = match[1];
       console.log("[WEBHOOK] Router decision:", agent, "| Text:", routerText.slice(0,60));
@@ -518,22 +521,18 @@ app.post("/webhook/twilio", express.urlencoded({ extended: false }), async (req,
     if (agent !== "none") {
       let agentResponse = "";
       try {
-        const agentRes = await fetch("https://api.anthropic.com/v1/messages", {
+        const geminiKey2 = process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY;
+        const agentPrompt = "Eres el agente " + agent.toUpperCase() + " de PrismDB, el Sistema Operativo Empresarial para LATAM. Responde mensajes de WhatsApp de forma cálida, directa y personalizada. Máximo 160 caracteres. Solo el mensaje, sin explicaciones.\n\nMensaje recibido: " + Body + "\nContexto: " + JSON.stringify(memory) + "\nGenera el mensaje de respuesta.";
+        const agentRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey2}`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": process.env.ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01"
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            model: "claude-haiku-4-5-20251001",
-            max_tokens: 200,
-            system: "Eres el agente " + agent.toUpperCase() + " de PrismDB, el Sistema Operativo Empresarial para LATAM. Responde mensajes de WhatsApp de forma cálida, directa y personalizada. Máximo 160 caracteres. Solo el mensaje, sin explicaciones.",
-            messages: [{ role: "user", content: "Mensaje recibido: " + Body + "\nContexto del contacto: " + JSON.stringify(memory) + "\nGenera el mensaje de respuesta." }]
+            contents: [{ parts: [{ text: agentPrompt }] }],
+            generationConfig: { maxOutputTokens: 200, temperature: 0.8 }
           })
         });
         const agentData = await agentRes.json();
-        agentResponse = agentData.content?.[0]?.text || "";
+        agentResponse = agentData.candidates?.[0]?.content?.parts?.[0]?.text || "";
         console.log("[WEBHOOK] Agent " + agent + " response:", agentResponse.slice(0,80));
       } catch(agentErr) {
         console.log("[WEBHOOK] Agent error:", agentErr.message);
