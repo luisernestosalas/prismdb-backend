@@ -487,11 +487,21 @@ app.post("/webhook/twilio", express.urlencoded({ extended: false }), async (req,
     }
 
     // 2. Claude decide qué agente actúa
-    const decision = await claudeChat(
-      `Router del Revenue OS. Decide qué agente responde. SOLO JSON: {"agent":"sdr|revenue|talent|none","reason":"..."}`,
-      `Mensaje: "${Body}"\nHistorial: ${JSON.stringify(memory)}`
-    );
-    const { agent } = JSON.parse(decision.replace(/```json|```/g, "").trim());
+    let agent = "sdr";
+    try {
+      const decision = await claudeChat(
+        `Eres el router de PrismDB. Responde SOLO con JSON válido, sin texto adicional:\n{"agent":"sdr","reason":"..."}\nOpciones: sdr=prospección, revenue=ventas/compra, talent=empleo, none=irrelevante.`,
+        `Mensaje: "${Body}"\nHistorial: ${JSON.stringify(memory)}`
+      );
+      const cleaned = (decision || "").replace(/\`\`\`json|\`\`\`/g, "").trim();
+      const match = cleaned.match(/\{[^}]+\}/);
+      if (match) {
+        const parsed = JSON.parse(match[0]);
+        agent = parsed.agent || "sdr";
+      }
+    } catch (parseErr) {
+      console.log("[WEBHOOK] parse fallback → agente sdr");
+    }
 
     // 3. Agente genera respuesta
     if (agent !== "none") {
