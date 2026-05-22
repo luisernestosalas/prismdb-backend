@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════
-//  PrismDB — Backend v2.0 — WhatsApp Revenue OS™
-//  Memory Layer · 3 Agentes IA · Finance AI · Event-driven
+//  PrismDB — Backend v2.1 — Autonomous Enterprise OS™
+//  Memory Layer · AI Router · Event Bus · 4 Módulos IA
 // ═══════════════════════════════════════════════════════════
 
 import express from "express";
@@ -8,6 +8,7 @@ import cors from "cors";
 import helmet from "helmet";
 import dotenv from "dotenv";
 import pg from "pg";
+import { processEvent, startEventBus, EVENT_TYPES, autonomyDecision, classifyEvent } from "./router.js";
 
 dotenv.config();
 
@@ -67,6 +68,7 @@ if (process.env.DATABASE_URL) {
       client.release();
       memoryMode = "postgresql";
       console.log("✅ PostgreSQL conectado — Memory Layer activa");
+      startEventBus(db, 60000);
     })
     .catch((err) => {
       console.error("⚠️  PostgreSQL error:", err.message);
@@ -80,7 +82,7 @@ const eventsStore = [];
 
 // ── Health ────────────────────────────────────────────────
 app.get("/health", (_req, res) =>
-  res.json({ ok: true, app: "prismdb", version: "2.0", memory: memoryMode, ts: Date.now() })
+  res.json({ ok: true, app: "prismdb", version: "2.1", memory: memoryMode, event_bus: memoryMode === "postgresql" ? "active" : "standby", ts: Date.now() })
 );
 
 // ══════════════════════════════════════════════════════════
@@ -705,6 +707,85 @@ Contenido: ${content.slice(0, 2000)}`, "claude-haiku-4-5-20251001", 300);
   } catch (err) { next(err); }
 });
 
+
+// ══════════════════════════════════════════════════════════
+//  AI ROUTER — RUTAS HTTP
+// ══════════════════════════════════════════════════════════
+
+// POST /router/event — procesar cualquier evento manualmente
+app.post("/router/event", async (req, res, next) => {
+  try {
+    const event = req.body;
+    if (!event.type) return res.status(400).json({ error: "event.type requerido" });
+    if (!event.entityId) return res.status(400).json({ error: "event.entityId requerido" });
+    const result = await processEvent(event, db);
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// POST /router/classify — solo clasificar, sin ejecutar
+app.post("/router/classify", async (req, res, next) => {
+  try {
+    const { event, memory = {} } = req.body;
+    if (!event) return res.status(400).json({ error: "event requerido" });
+    const classification = await classifyEvent(event, memory);
+    const autonomy = autonomyDecision(classification);
+    res.json({ classification, autonomy, event_types: Object.values(EVENT_TYPES) });
+  } catch (err) { next(err); }
+});
+
+// GET /router/events — historial de eventos procesados por el router
+app.get("/router/events", async (_req, res, next) => {
+  try {
+    if (db && memoryMode === "postgresql") {
+      const result = await db.query(`
+        SELECT * FROM events
+        WHERE type = 'router.processed'
+        ORDER BY created_at DESC
+        LIMIT 50
+      `);
+      return res.json({ events: result.rows, total: result.rowCount });
+    }
+    res.json({ events: eventsStore.filter(e => e.type === "router.processed").slice(-50), mode: "in-memory" });
+  } catch (err) { next(err); }
+});
+
+// GET /router/event-types — todos los tipos de eventos disponibles
+app.get("/router/event-types", (_req, res) => {
+  res.json({
+    event_types: EVENT_TYPES,
+    total: Object.keys(EVENT_TYPES).length,
+    categories: {
+      whatsapp: ["whatsapp.inbound", "whatsapp.no_reply"],
+      sales: ["lead.new", "lead.qualified", "deal.stalled", "deal.at_risk", "deal.closed"],
+      payments: ["payment.success", "payment.failed", "payment.overdue"],
+      campaigns: ["campaign.trigger", "client.inactive", "catalog.request"],
+      talent: ["candidate.replied", "candidate.ghosted", "vacancy.opened"],
+      finance: ["revenue.alert", "forecast.ready"],
+      system: ["system.scheduled", "system.manual"],
+    },
+  });
+});
+
+// POST /router/test — probar el router con un evento simulado
+app.post("/router/test", async (req, res, next) => {
+  try {
+    const { event_type, entity_id = "test_001", extra = {} } = req.body;
+    const testEvent = {
+      type: event_type || EVENT_TYPES.WHATSAPP_INBOUND,
+      entityId: entity_id,
+      entityType: "contact",
+      message: extra.message || "Hola, me interesa saber más",
+      phone: extra.phone,
+      amount: extra.amount,
+      data: extra,
+      triggeredBy: "manual_test",
+    };
+    const result = await processEvent(testEvent, db);
+    res.json({ ok: true, test: true, result });
+  } catch (err) { next(err); }
+});
+
 // ── Error handler ─────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error("[ERROR]", err.message);
@@ -712,6 +793,7 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ PrismDB v2.0 corriendo en http://localhost:${PORT}`);
-  console.log(`   Memory: ${memoryMode} | Agents: SDR · Revenue · Talent | Finance AI activo`);
+  console.log(`✅ PrismDB v2.1 corriendo en http://localhost:${PORT}`);
+  console.log(`   Memory: ${memoryMode} | AI Router: activo | Event Bus: iniciando...`);
+  console.log(`   Módulos: SDR · Revenue · Ventas Activas · Talent · Finance`);
 });
