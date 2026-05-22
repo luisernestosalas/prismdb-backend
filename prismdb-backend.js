@@ -509,7 +509,8 @@ app.post("/webhook/twilio", express.urlencoded({ extended: false }), async (req,
         })
       });
       const routerData = await routerRes.json();
-      const routerText = routerData.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      console.log("[GEMINI RAW]", JSON.stringify(routerData).slice(0, 300));
+      const routerText = routerData.candidates?.[0]?.content?.parts?.[0]?.text || routerData.candidates?.[0]?.output || "";
       const match = routerText.match(/"agent"\s*:\s*"(\w+)"/);
       if (match) agent = match[1];
       console.log("[WEBHOOK] Router decision:", agent, "| Text:", routerText.slice(0,60));
