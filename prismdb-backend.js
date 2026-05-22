@@ -103,11 +103,11 @@ async function sendWhatsApp(to, message) {
   return await res.json();
 }
 
-async function claudeChat(system, userContent, model = "gemini-2.0-flash", maxTokens = 500) {
+async function claudeChat(system, userContent, model = "gemini-1.5-flash", maxTokens = 500) {
   try {
     const geminiKey = process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY;
     const prompt = system ? system + "\n\n" + userContent : userContent;
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`, {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -500,7 +500,7 @@ app.post("/webhook/twilio", express.urlencoded({ extended: false }), async (req,
     let agent = "sdr";
     try {
       const geminiKey = process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY;
-      const routerRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`, {
+      const routerRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -523,7 +523,7 @@ app.post("/webhook/twilio", express.urlencoded({ extended: false }), async (req,
       try {
         const geminiKey2 = process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY;
         const agentPrompt = "Eres el agente " + agent.toUpperCase() + " de PrismDB, el Sistema Operativo Empresarial para LATAM. Responde mensajes de WhatsApp de forma cálida, directa y personalizada. Máximo 160 caracteres. Solo el mensaje, sin explicaciones.\n\nMensaje recibido: " + Body + "\nContexto: " + JSON.stringify(memory) + "\nGenera el mensaje de respuesta.";
-        const agentRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey2}`, {
+        const agentRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey2}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
