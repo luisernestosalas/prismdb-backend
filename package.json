@@ -1,7 +1,7 @@
 {
   "name": "prismdb-backend",
-  "version": "1.0.0",
-  "description": "Backend PrismDB — Prospección con Firecrawl + Jelou + Anthropic",
+  "version": "2.0.0",
+  "description": "PrismDB — WhatsApp Revenue OS con Memory Layer + Agentes IA",
   "type": "module",
   "main": "prismdb-backend.js",
   "scripts": {
@@ -13,6 +13,7 @@
     "express": "^4.19.2",
     "cors":    "^2.8.5",
     "helmet":  "^7.1.0",
-    "dotenv":  "^16.4.5"
+    "dotenv":  "^16.4.5",
+    "pg":      "^8.11.0"
   }
 }
