@@ -1782,37 +1782,10 @@ app.post("/graph/bulk", async (req, res, next) => {
 // ══════════════════════════════════════════════════════════
 
 // Parsear CSV simple (sin librerías)
-function parseCSV(text) {
-  const lines = text.trim().split('\n');
-  if (lines.length < 2) return [];
-  const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
-  return lines.slice(1).map(line => {
-    const vals = line.split(',').map(v => v.trim().replace(/"/g, ''));
-    const obj = {};
-    headers.forEach((h, i) => obj[h] = vals[i] || '');
-    return obj;
-  }).filter(r => Object.values(r).some(v => v));
-}
+
 
 // Normalizar campos de contacto (acepta columnas con distintos nombres)
-function normalizeContact(raw) {
-  const find = (...keys) => {
-    for (const k of keys) {
-      if (raw[k] !== undefined && raw[k] !== '') return raw[k];
-    }
-    return '';
-  };
-  return {
-    nombre:   find('nombre', 'name', 'cliente', 'razon_social', 'empresa'),
-    telefono: find('telefono', 'phone', 'celular', 'movil', 'whatsapp', 'tel'),
-    email:    find('email', 'correo', 'mail'),
-    empresa:  find('empresa', 'company', 'negocio', 'razon_social'),
-    ciudad:   find('ciudad', 'city', 'municipio'),
-    segmento: find('segmento', 'segment', 'categoria', 'tipo', 'grupo'),
-    notas:    find('notas', 'notes', 'observaciones', 'comentarios'),
-    ...raw,
-  };
-}
+
 
 // In-memory store para bases de datos cargadas (fallback si no hay DB)
 const activaStore = {
