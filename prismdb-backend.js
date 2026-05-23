@@ -1788,11 +1788,7 @@ app.post("/graph/bulk", async (req, res, next) => {
 
 
 // In-memory store para bases de datos cargadas (fallback si no hay DB)
-const activaStore = {
-  bases: {},       // id → { nombre, contactos[], created_at }
-  catalogos: {},   // id → { nombre, productos[], created_at }
-  campanas: {},    // id → { config, resultados[], created_at }
-};
+
 
 // ══════════════════════════════════════════════════════════
 //  1. BASES DE DATOS
