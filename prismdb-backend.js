@@ -2152,7 +2152,7 @@ app.get("/audit/export", async (req, res, next) => {
     res.setHeader("Content-Disposition", `attachment; filename="prismdb-audit-${Date.now()}.csv"`);
     res.send(csv);
   } catch (err) { next(err); }
-}); 
+});
 // ═══════════════════════════════════════════════════════════
 //  PrismDB — pgvector / Memoria Semántica
 //  Embeddings con Gemini text-embedding-004
