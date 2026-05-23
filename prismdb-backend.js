@@ -1,4 +1,4 @@
-// ═══════════════════════════════════════════════════════════
+ // ═══════════════════════════════════════════════════════════
 //  PrismDB — Backend v2.1 — Autonomous Enterprise OS™
 //  Memory Layer · AI Router · Event Bus · 4 Módulos IA
 // ═══════════════════════════════════════════════════════════
@@ -2315,7 +2315,7 @@ async function semanticSearch(query, options = {}) {
 // ══════════════════════════════════════════════════════════
 
 // POST /memory/embed — guardar texto en memoria semántica
-app.post("/memory/embed", async (req, res, next) => {
+app.post("/semantic/embed", async (req, res, next) => {
   try {
     const { entity_id, entity_type = "contact", content, metadata = {}, agent = "system" } = req.body;
     if (!entity_id || !content) return res.status(400).json({ error: "entity_id y content requeridos" });
@@ -2328,7 +2328,7 @@ app.post("/memory/embed", async (req, res, next) => {
 });
 
 // POST /memory/search — búsqueda semántica
-app.post("/memory/search", async (req, res, next) => {
+app.post("/semantic/search", async (req, res, next) => {
   try {
     const { query, limit = 5, threshold = 0.6, entity_type, agent } = req.body;
     if (!query) return res.status(400).json({ error: "query requerido" });
@@ -2369,7 +2369,7 @@ Responde directamente sin preámbulo.` }] }],
 });
 
 // POST /memory/similar — encontrar entidades similares a una dada
-app.post("/memory/similar", async (req, res, next) => {
+app.post("/semantic/similar", async (req, res, next) => {
   try {
     const { entity_id, limit = 5 } = req.body;
     if (!entity_id) return res.status(400).json({ error: "entity_id requerido" });
@@ -2405,7 +2405,7 @@ app.post("/memory/similar", async (req, res, next) => {
 });
 
 // POST /memory/patterns — detectar patrones entre entidades
-app.post("/memory/patterns", async (req, res, next) => {
+app.post("/semantic/patterns", async (req, res, next) => {
   try {
     const { context = "ventas", limit = 10 } = req.body;
     if (!db || memoryMode !== "postgresql") return res.json({ patterns: [] });
@@ -2446,7 +2446,7 @@ Responde SOLO JSON:
 });
 
 // GET /memory/stats/vector — estadísticas de la memoria semántica
-app.get("/memory/stats/vector", async (_req, res, next) => {
+app.get("/semantic/stats", async (_req, res, next) => {
   try {
     if (!db || memoryMode !== "postgresql") return res.json({ stats: {}, mode: "in-memory" });
 
@@ -2470,4 +2470,3 @@ app.get("/memory/stats/vector", async (_req, res, next) => {
 globalThis.saveKnowledge = saveKnowledge;
 globalThis.semanticSearch = semanticSearch;
 globalThis.generateEmbedding = generateEmbedding;
-
