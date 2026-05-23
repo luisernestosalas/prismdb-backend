@@ -2678,7 +2678,7 @@ async function initVectorTables() {
       entity_type TEXT,
       content     TEXT NOT NULL,
       summary     TEXT,
-      embedding   vector(768),
+      embedding   vector(512),
       metadata    JSONB DEFAULT '{}',
       agent       TEXT,
       created_at  TIMESTAMPTZ DEFAULT NOW()
@@ -2699,7 +2699,7 @@ async function initVectorTables() {
       id          SERIAL PRIMARY KEY,
       pattern     TEXT NOT NULL,
       description TEXT,
-      embedding   vector(768),
+      embedding   vector(512),
       examples    JSONB DEFAULT '[]',
       confidence  NUMERIC DEFAULT 0,
       agent       TEXT,
@@ -2716,21 +2716,22 @@ setTimeout(initVectorTables, 5000);
 // ══════════════════════════════════════════════════════════
 async function generateEmbedding(text) {
   try {
-    const geminiKey = process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY;
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${geminiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "models/text-embedding-004",
-          content: { parts: [{ text: text.slice(0, 2000) }] },
-          taskType: "SEMANTIC_SIMILARITY"
-        })
-      }
-    );
+    const voyageKey = process.env.VOYAGE_API_KEY;
+    if (!voyageKey) { console.error("[EMBEDDING] VOYAGE_API_KEY no configurada"); return null; }
+    const res = await fetch("https://api.voyageai.com/v1/embeddings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${voyageKey}` },
+      body: JSON.stringify({
+        model: "voyage-3-lite",
+        input: text.slice(0, 4000),
+        input_type: "document"
+      })
+    });
     const data = await res.json();
-    return data.embedding?.values || null;
+    if (data.error) { console.error("[EMBEDDING ERROR]", data.error); return null; }
+    const embedding = data.data?.[0]?.embedding || null;
+    console.log("[EMBEDDING] Voyage OK, dims:", embedding?.length);
+    return embedding;
   } catch (e) {
     console.error("[EMBEDDING ERROR]", e.message);
     return null;
