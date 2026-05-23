@@ -1778,388 +1778,378 @@ app.listen(PORT, () => {
   console.log(`   Memory: ${memoryMode} | AI Router activo | Event Bus iniciando...`);
   console.log(`   Módulos: SDR · Revenue · Ventas Activas · Talent · Finance · Enterprise Graph`);
 });
-<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>PrismDB — Audit Layer</title>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#0c0e14;--bg2:#13161f;--bg3:#1a1e2a;--bg4:#222638;
-  --border:#2a2f42;--border2:#363c55;
-  --accent:#6366f1;--accent2:#818cf8;
-  --green:#22c55e;--yellow:#eab308;--red:#ef4444;
-  --blue:#3b82f6;--purple:#a855f7;--orange:#f97316;
-  --text:#e2e8f0;--muted:#64748b;--muted2:#94a3b8;
-  --mono:'JetBrains Mono',monospace;--sans:'Inter',sans-serif;
-}
-body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13px;min-height:100vh}
-.topbar{display:flex;align-items:center;justify-content:space-between;padding:11px 20px;background:var(--bg2);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10}
-.logo{font-family:var(--mono);font-weight:600;font-size:13px}
-.logo span{color:var(--accent)}
-.topbar-right{display:flex;align-items:center;gap:8px}
-.btn{display:inline-flex;align-items:center;gap:5px;padding:6px 12px;border-radius:5px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid transparent;transition:all .15s}
-.btn-ghost{background:var(--bg3);color:var(--muted2);border-color:var(--border)}
-.btn-ghost:hover{color:var(--text);border-color:var(--border2)}
-.btn-primary{background:var(--accent);color:#fff}
-.status-pill{display:flex;align-items:center;gap:5px;font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--green)}
-.dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+// ═══════════════════════════════════════════════════════════
+//  PrismDB — Audit Layer
+//  Registro completo de cada decisión de la infraestructura
+//
+//  Registra:
+//  - POR QUÉ la IA hizo algo
+//  - QUÉ información usó
+//  - QUIÉN aprobó
+//  - QUÉ riesgo detectó
+//  - QUÉ acción ejecutó
+//  - QUÉ resultado obtuvo
+//
+//  AGREGAR AL FINAL DE prismdb-backend.js
+//  (antes del error handler)
+// ═══════════════════════════════════════════════════════════
 
-.page{padding:20px;max-width:1400px}
+// ── INICIALIZAR TABLA DE AUDITORÍA ───────────────────────
+async function initAuditTable() {
+  if (!db || memoryMode !== "postgresql") return;
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id            SERIAL PRIMARY KEY,
+      trace_id      TEXT NOT NULL,
+      timestamp     TIMESTAMPTZ DEFAULT NOW(),
 
-/* STATS */
-.stats-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:20px}
-.stat{background:var(--bg2);border:1px solid var(--border);border-radius:7px;padding:14px;position:relative;overflow:hidden}
-.stat::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
-.stat.c-green::before{background:var(--green)}.stat.c-blue::before{background:var(--blue)}
-.stat.c-purple::before{background:var(--purple)}.stat.c-yellow::before{background:var(--yellow)}
-.stat.c-red::before{background:var(--red)}
-.stat-label{font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
-.stat-val{font-family:var(--mono);font-size:22px;font-weight:600;color:var(--text);line-height:1}
-.stat-sub{font-size:10px;color:var(--muted);margin-top:4px}
+      -- Qué pasó
+      event_type    TEXT NOT NULL,
+      action        TEXT NOT NULL,
+      outcome       TEXT NOT NULL DEFAULT 'success',
 
-/* FILTERS */
-.filters{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center}
-.filter-input{background:var(--bg3);border:1px solid var(--border);border-radius:5px;color:var(--text);font-family:var(--mono);font-size:11px;padding:6px 10px;outline:none;transition:border-color .15s}
-.filter-input:focus{border-color:var(--accent)}
-select.filter-input option{background:var(--bg3)}
+      -- Quién / qué entidad
+      entity_id     TEXT,
+      entity_type   TEXT,
+      agent         TEXT,
 
-/* MAIN TABLE */
-.panel{background:var(--bg2);border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:16px}
-.panel-header{padding:11px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
-.panel-title{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);display:flex;align-items:center;gap:6px}
-.tbl{width:100%;border-collapse:collapse}
-.tbl th{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:8px 12px;text-align:left;border-bottom:1px solid var(--border)}
-.tbl td{padding:9px 12px;border-bottom:1px solid var(--border);font-size:12px;color:var(--muted2);vertical-align:top}
-.tbl tr:last-child td{border-bottom:none}
-.tbl tr:hover td{background:var(--bg3);cursor:pointer}
-.badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:3px;font-size:10px;font-weight:600}
-.badge-success{background:rgba(34,197,94,.15);color:var(--green)}
-.badge-error{background:rgba(239,68,68,.15);color:var(--red)}
-.badge-pending{background:rgba(234,179,8,.15);color:var(--yellow)}
-.badge-auto{background:rgba(34,197,94,.1);color:var(--green)}
-.badge-notify{background:rgba(234,179,8,.1);color:var(--yellow)}
-.badge-approve{background:rgba(239,68,68,.1);color:var(--red)}
-.badge-agent{background:rgba(99,102,241,.15);color:var(--accent2)}
-.mono-sm{font-family:var(--mono);font-size:10px;color:var(--muted)}
-.truncate{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      -- Por qué — razonamiento de la IA
+      reasoning     TEXT,
+      confidence    TEXT,
+      risk_level    TEXT,
 
-/* DETAIL PANEL */
-.detail-overlay{position:fixed;inset:0;z-index:100;background:rgba(12,14,20,.85);backdrop-filter:blur(8px);display:none;align-items:flex-start;justify-content:flex-end;padding:16px}
-.detail-overlay.open{display:flex}
-.detail-panel{background:var(--bg2);border:1px solid var(--border);border-radius:8px;width:520px;max-height:calc(100vh - 32px);overflow-y:auto;display:flex;flex-direction:column}
-.detail-header{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:var(--bg2);z-index:1}
-.detail-close{cursor:pointer;color:var(--muted);font-size:18px;transition:color .15s}
-.detail-close:hover{color:var(--text)}
-.detail-body{padding:16px;display:flex;flex-direction:column;gap:14px}
-.detail-section{background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:12px}
-.detail-section-title{font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
-.detail-row{display:flex;justify-content:space-between;align-items:flex-start;padding:4px 0;border-bottom:1px solid var(--border);gap:12px}
-.detail-row:last-child{border-bottom:none}
-.detail-key{font-size:11px;color:var(--muted);flex-shrink:0;min-width:100px}
-.detail-val{font-size:11px;color:var(--text);text-align:right;word-break:break-word}
-.ai-box{background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.2);border-radius:5px;padding:10px;font-size:12px;color:var(--accent2);line-height:1.6}
-.message-box{background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.15);border-radius:5px;padding:10px;font-size:12px;color:var(--muted2);line-height:1.6;font-style:italic}
-.timeline-item{display:flex;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)}
-.timeline-item:last-child{border-bottom:none}
-.tl-time{font-family:var(--mono);font-size:10px;color:var(--muted);flex-shrink:0;min-width:70px}
-.tl-content{flex:1;font-size:11px;color:var(--muted2)}
+      -- Qué información usó
+      context_used  JSONB DEFAULT '{}',
+      memory_keys   TEXT[],
 
-/* EXPORT */
-.export-bar{display:flex;align-items:center;gap:8px;padding:10px 16px;background:var(--bg3);border-top:1px solid var(--border)}
+      -- Qué ejecutó
+      action_taken  TEXT,
+      message_sent  TEXT,
+      whatsapp_to   TEXT,
 
-/* SPINNER */
-.spinner{width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.loading{display:flex;align-items:center;justify-content:center;padding:40px;gap:10px;color:var(--muted);font-size:12px}
-.empty{color:var(--muted);text-align:center;padding:40px;font-size:12px}
-</style>
-</head>
-<body>
+      -- Resultado
+      result        JSONB DEFAULT '{}',
+      duration_ms   INTEGER,
 
-<div class="topbar">
-  <div class="logo">Prism<span>DB</span> · <span style="color:var(--muted)">Audit Layer</span></div>
-  <div class="topbar-right">
-    <div class="status-pill"><div class="dot"></div><span id="api-status">conectando...</span></div>
-    <a href="/audit/export" class="btn btn-ghost" id="export-btn">↓ Exportar CSV</a>
-    <button class="btn btn-ghost" onclick="loadAll()">↻ Actualizar</button>
-  </div>
-</div>
+      -- Aprobación humana
+      autonomy_mode TEXT,
+      approved_by   TEXT,
+      approved_at   TIMESTAMPTZ,
 
-<div class="page">
+      -- Metadata
+      source        TEXT DEFAULT 'system',
+      version       TEXT DEFAULT '2.1'
+    );
 
-  <!-- STATS -->
-  <div class="stats-grid" id="stats-grid">
-    <div class="stat c-blue"><div class="stat-label">Total decisiones</div><div class="stat-val" id="s-total">—</div><div class="stat-sub">por la infraestructura</div></div>
-    <div class="stat c-green"><div class="stat-label">Exitosas</div><div class="stat-val" id="s-success">—</div><div class="stat-sub">resultado correcto</div></div>
-    <div class="stat c-purple"><div class="stat-label">Autónomas</div><div class="stat-val" id="s-auto">—</div><div class="stat-sub">sin intervención humana</div></div>
-    <div class="stat c-yellow"><div class="stat-label">Notificaron</div><div class="stat-val" id="s-notify">—</div><div class="stat-sub">avisaron al equipo</div></div>
-    <div class="stat c-red"><div class="stat-label">Aprobación requerida</div><div class="stat-val" id="s-approve">—</div><div class="stat-sub">riesgo alto detectado</div></div>
-  </div>
-
-  <!-- FILTERS -->
-  <div class="filters">
-    <span style="font-size:11px;color:var(--muted)">Filtrar:</span>
-    <select class="filter-input" id="f-agent" onchange="loadLogs()">
-      <option value="">Todos los agentes</option>
-      <option value="sdr">SDR</option>
-      <option value="revenue">Revenue</option>
-      <option value="talent">Talent</option>
-      <option value="finance">Finance</option>
-      <option value="campaign">Campaign</option>
-    </select>
-    <select class="filter-input" id="f-outcome" onchange="loadLogs()">
-      <option value="">Todos los resultados</option>
-      <option value="success">Exitoso</option>
-      <option value="error">Error</option>
-    </select>
-    <select class="filter-input" id="f-autonomy" onchange="loadLogs()">
-      <option value="">Toda autonomía</option>
-      <option value="auto">Autónomo</option>
-      <option value="notify">Notificó</option>
-      <option value="approve">Requirió aprobación</option>
-    </select>
-    <input type="text" class="filter-input" id="f-entity" placeholder="Entity ID..." onkeyup="debounce(loadLogs,400)()"/>
-    <button class="btn btn-ghost" onclick="clearFilters()">× Limpiar</button>
-  </div>
-
-  <!-- AUDIT TABLE -->
-  <div class="panel">
-    <div class="panel-header">
-      <div class="panel-title">🔍 Registro de auditoría</div>
-      <span id="log-count" style="font-size:10px;color:var(--muted)"></span>
-    </div>
-    <div id="audit-table-wrap">
-      <div class="loading"><div class="spinner"></div>Cargando registros...</div>
-    </div>
-    <div class="export-bar">
-      <span style="font-size:11px;color:var(--muted)">Exportar datos de auditoría para compliance o revisión:</span>
-      <a href="#" onclick="exportCSV()" class="btn btn-ghost" style="margin-left:auto">↓ CSV</a>
-    </div>
-  </div>
-
-  <!-- AGENT BREAKDOWN -->
-  <div class="panel">
-    <div class="panel-header"><div class="panel-title">📊 Actividad por agente</div></div>
-    <div id="agent-breakdown" style="padding:16px">
-      <div class="loading"><div class="spinner"></div></div>
-    </div>
-  </div>
-
-</div>
-
-<!-- DETAIL PANEL -->
-<div class="detail-overlay" id="detail-overlay" onclick="if(event.target===this)closeDetail()">
-  <div class="detail-panel">
-    <div class="detail-header">
-      <div>
-        <div style="font-size:13px;font-weight:600;color:var(--text)" id="detail-title">Detalle de decisión</div>
-        <div style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:2px" id="detail-trace"></div>
-      </div>
-      <span class="detail-close" onclick="closeDetail()">×</span>
-    </div>
-    <div class="detail-body" id="detail-body">
-      <div class="loading"><div class="spinner"></div>Cargando...</div>
-    </div>
-  </div>
-</div>
-
-<script>
-const API = 'https://prismdb-backend-production.up.railway.app';
-let debounceTimer;
-function debounce(fn, ms) { return (...args) => { clearTimeout(debounceTimer); debounceTimer = setTimeout(() => fn(...args), ms); }; }
-
-async function apiFetch(path) {
-  const r = await fetch(API + path);
-  return r.json();
+    CREATE INDEX IF NOT EXISTS audit_entity_idx    ON audit_log(entity_id);
+    CREATE INDEX IF NOT EXISTS audit_timestamp_idx ON audit_log(timestamp DESC);
+    CREATE INDEX IF NOT EXISTS audit_agent_idx     ON audit_log(agent);
+    CREATE INDEX IF NOT EXISTS audit_trace_idx     ON audit_log(trace_id);
+  `).catch(e => console.error("[AUDIT INIT]", e.message));
+  console.log("✅ Audit Layer activo");
 }
 
-async function checkHealth() {
-  try {
-    const d = await apiFetch('/health');
-    const el = document.getElementById('api-status');
-    el.textContent = d.ok ? `v${d.version} · ${d.memory}` : 'error';
-    el.style.color = d.ok ? 'var(--green)' : 'var(--red)';
-  } catch { document.getElementById('api-status').textContent = 'sin conexión'; }
+setTimeout(initAuditTable, 4000);
+
+// ── FUNCIÓN PRINCIPAL DE AUDITORÍA ──────────────────────
+async function auditLog({
+  trace_id,
+  event_type,
+  action,
+  outcome = "success",
+  entity_id,
+  entity_type,
+  agent,
+  reasoning,
+  confidence,
+  risk_level,
+  context_used = {},
+  memory_keys = [],
+  action_taken,
+  message_sent,
+  whatsapp_to,
+  result = {},
+  duration_ms,
+  autonomy_mode,
+  approved_by,
+  source = "system",
+}) {
+  if (!db || memoryMode !== "postgresql") return;
+
+  await db.query(`
+    INSERT INTO audit_log (
+      trace_id, event_type, action, outcome,
+      entity_id, entity_type, agent,
+      reasoning, confidence, risk_level,
+      context_used, memory_keys,
+      action_taken, message_sent, whatsapp_to,
+      result, duration_ms, autonomy_mode, approved_by, source
+    ) VALUES (
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+      $11,$12,$13,$14,$15,$16,$17,$18,$19,$20
+    )
+  `, [
+    trace_id || `trace_${Date.now()}`,
+    event_type, action, outcome,
+    entity_id, entity_type, agent,
+    reasoning, confidence, risk_level,
+    context_used, memory_keys,
+    action_taken, message_sent, whatsapp_to,
+    result, duration_ms, autonomy_mode, approved_by, source,
+  ]).catch(e => console.error("[AUDIT ERROR]", e.message));
 }
 
-async function loadStats() {
-  try {
-    const d = await apiFetch('/audit/stats');
-    document.getElementById('s-total').textContent = (d.total_decisions||0).toLocaleString();
-    const success = d.by_outcome?.find(o=>o.outcome==='success')?.count || 0;
-    document.getElementById('s-success').textContent = parseInt(success).toLocaleString();
-    const auto = d.by_autonomy?.find(a=>a.autonomy_mode==='auto')?.count || 0;
-    const notify = d.by_autonomy?.find(a=>a.autonomy_mode==='notify')?.count || 0;
-    const approve = d.by_autonomy?.find(a=>a.autonomy_mode==='approve')?.count || 0;
-    document.getElementById('s-auto').textContent = parseInt(auto).toLocaleString();
-    document.getElementById('s-notify').textContent = parseInt(notify).toLocaleString();
-    document.getElementById('s-approve').textContent = parseInt(approve).toLocaleString();
-
-    // Agent breakdown
-    const agents = d.by_agent || [];
-    const icons = {sdr:'🎯',revenue:'💰',talent:'👥',finance:'📊',campaign:'🛒'};
-    document.getElementById('agent-breakdown').innerHTML = agents.length ? `
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px">
-        ${agents.map(a=>`
-          <div style="background:var(--bg3);border:1px solid var(--border);border-radius:5px;padding:10px;text-align:center">
-            <div style="font-size:20px;margin-bottom:4px">${icons[a.agent]||'⚡'}</div>
-            <div style="font-family:var(--mono);font-size:16px;font-weight:600;color:var(--text)">${parseInt(a.count).toLocaleString()}</div>
-            <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">${a.agent}</div>
-          </div>`).join('')}
-      </div>` : '<div class="empty">Sin actividad registrada aún.</div>';
-  } catch(e) { console.error(e); }
-}
-
-async function loadLogs() {
-  const agent = document.getElementById('f-agent').value;
-  const outcome = document.getElementById('f-outcome').value;
-  const entity_id = document.getElementById('f-entity').value;
-  const autonomy = document.getElementById('f-autonomy').value;
-
-  let qs = '?limit=50';
-  if (agent) qs += `&agent=${agent}`;
-  if (outcome) qs += `&outcome=${outcome}`;
-  if (entity_id) qs += `&entity_id=${entity_id}`;
-  if (autonomy) qs += `&autonomy=${autonomy}`;
-
-  document.getElementById('audit-table-wrap').innerHTML = '<div class="loading"><div class="spinner"></div>Cargando...</div>';
+// ── WRAPPER DEL ROUTER CON AUDITORÍA ────────────────────
+// Envuelve processEvent para registrar cada decisión
+async function auditedProcessEvent(event, dbConn) {
+  const traceId = `trace_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+  const startTime = Date.now();
 
   try {
-    const d = await apiFetch('/audit' + qs);
-    const logs = d.logs || [];
-    document.getElementById('log-count').textContent = `${d.total || logs.length} registros`;
+    const result = await processEvent(event, dbConn);
+    const duration = Date.now() - startTime;
 
-    if (!logs.length) {
-      document.getElementById('audit-table-wrap').innerHTML = '<div class="empty">Sin registros de auditoría aún. Los registros aparecen cuando los agentes procesan eventos.</div>';
-      return;
-    }
+    await auditLog({
+      trace_id: traceId,
+      event_type: event.type,
+      action: result.classification?.action || "event_processed",
+      outcome: result.error ? "error" : "success",
+      entity_id: event.entityId,
+      entity_type: event.entityType,
+      agent: result.classification?.agent,
+      reasoning: result.classification?.reason,
+      confidence: result.classification?.confidence,
+      risk_level: result.classification?.risk,
+      context_used: { event_data: event.data, memory_snapshot: {} },
+      action_taken: result.actions_taken?.join(", "),
+      message_sent: result.agent_response?.slice(0, 500),
+      autonomy_mode: result.autonomy,
+      result: { actions: result.actions_taken, memory_updated: result.memory_updated },
+      duration_ms: duration,
+      source: event.triggeredBy || "system",
+    });
 
-    const agentColors = {sdr:'blue',revenue:'green',talent:'orange',finance:'purple',campaign:'purple'};
-    document.getElementById('audit-table-wrap').innerHTML = `
-      <table class="tbl">
-        <thead><tr>
-          <th>Timestamp</th><th>Evento</th><th>Agente</th><th>Acción</th>
-          <th>Autonomía</th><th>Resultado</th><th>Duración</th><th>Entidad</th>
-        </tr></thead>
-        <tbody>${logs.map(l=>`
-          <tr onclick="openDetail('${l.trace_id}','${l.entity_id||''}')">
-            <td class="mono-sm">${new Date(l.timestamp).toLocaleString('es-CO',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td>
-            <td><span class="mono-sm">${l.event_type||'—'}</span></td>
-            <td>${l.agent?`<span class="badge badge-agent">${l.agent}</span>`:'—'}</td>
-            <td class="truncate" style="max-width:180px;color:var(--text)">${l.action||'—'}</td>
-            <td>${l.autonomy_mode?`<span class="badge badge-${l.autonomy_mode}">${l.autonomy_mode}</span>`:'—'}</td>
-            <td><span class="badge badge-${l.outcome==='success'?'success':'error'}">${l.outcome==='success'?'✓':'✗'} ${l.outcome}</span></td>
-            <td class="mono-sm">${l.duration_ms?l.duration_ms+'ms':'—'}</td>
-            <td class="mono-sm truncate" style="max-width:120px">${l.entity_id||'—'}</td>
-          </tr>`).join('')}
-        </tbody>
-      </table>`;
-  } catch(e) {
-    document.getElementById('audit-table-wrap').innerHTML = '<div class="empty">Error cargando registros.</div>';
+    return { ...result, trace_id: traceId };
+  } catch (err) {
+    await auditLog({
+      trace_id: traceId,
+      event_type: event.type,
+      action: "event_processing_failed",
+      outcome: "error",
+      entity_id: event.entityId,
+      reasoning: err.message,
+      duration_ms: Date.now() - startTime,
+    });
+    throw err;
   }
 }
 
-async function openDetail(traceId, entityId) {
-  document.getElementById('detail-overlay').classList.add('open');
-  document.getElementById('detail-title').textContent = 'Detalle de decisión';
-  document.getElementById('detail-trace').textContent = traceId;
-  document.getElementById('detail-body').innerHTML = '<div class="loading"><div class="spinner"></div>Analizando con IA...</div>';
+// ══════════════════════════════════════════════════════════
+//  RUTAS DE AUDITORÍA
+// ══════════════════════════════════════════════════════════
 
+// GET /audit — log completo paginado
+app.get("/audit", async (req, res, next) => {
   try {
-    const [detail, entity] = await Promise.all([
-      apiFetch('/audit/' + traceId),
-      entityId ? apiFetch('/audit/entity/' + entityId) : Promise.resolve(null),
+    if (!db || memoryMode !== "postgresql") return res.json({ logs: [], total: 0 });
+
+    const {
+      limit = 50, offset = 0,
+      agent, entity_id, outcome,
+      from, to, event_type,
+    } = req.query;
+
+    let query = "SELECT * FROM audit_log WHERE 1=1";
+    const params = [];
+
+    if (agent)      { params.push(agent);      query += ` AND agent = $${params.length}`; }
+    if (entity_id)  { params.push(entity_id);  query += ` AND entity_id = $${params.length}`; }
+    if (outcome)    { params.push(outcome);     query += ` AND outcome = $${params.length}`; }
+    if (event_type) { params.push(event_type);  query += ` AND event_type = $${params.length}`; }
+    if (from)       { params.push(from);        query += ` AND timestamp >= $${params.length}`; }
+    if (to)         { params.push(to);          query += ` AND timestamp <= $${params.length}`; }
+
+    const countResult = await db.query(
+      query.replace("SELECT *", "SELECT COUNT(*)"), params
+    );
+
+    params.push(parseInt(limit));
+    params.push(parseInt(offset));
+    query += ` ORDER BY timestamp DESC LIMIT $${params.length - 1} OFFSET $${params.length}`;
+
+    const result = await db.query(query, params);
+
+    res.json({
+      logs: result.rows,
+      total: parseInt(countResult.rows[0].count),
+      limit: parseInt(limit),
+      offset: parseInt(offset),
+    });
+  } catch (err) { next(err); }
+});
+
+// GET /audit/:traceId — detalle completo de una decisión
+app.get("/audit/:traceId", async (req, res, next) => {
+  try {
+    if (!db || memoryMode !== "postgresql") return res.status(503).json({ error: "Requiere PostgreSQL" });
+
+    const result = await db.query(
+      "SELECT * FROM audit_log WHERE trace_id = $1 ORDER BY timestamp ASC",
+      [req.params.traceId]
+    );
+
+    if (!result.rows.length) return res.status(404).json({ error: "Trace no encontrado" });
+
+    // Análisis IA del trace
+    const analysis = await claudeChat(
+      "Analista de auditoría de sistemas IA. Explica en lenguaje simple qué hizo el sistema. SOLO JSON.",
+      `Analiza estas entradas de auditoría y explica qué pasó:
+${JSON.stringify(result.rows)}
+
+JSON: {
+  "resumen": "qué pasó en 2 oraciones simples",
+  "decision_correcta": true,
+  "riesgo_detectado": "...",
+  "informacion_usada": ["..."],
+  "accion_ejecutada": "...",
+  "resultado": "...",
+  "recomendacion": "..."
+}`
+    ).catch(() => "{}");
+
+    let analysisObj = {};
+    try { analysisObj = JSON.parse(analysis.replace(/```json|```/g, "").trim()); } catch {}
+
+    res.json({
+      trace_id: req.params.traceId,
+      entries: result.rows,
+      analysis: analysisObj,
+    });
+  } catch (err) { next(err); }
+});
+
+// GET /audit/entity/:entityId — historial de auditoría de una entidad
+app.get("/audit/entity/:entityId", async (req, res, next) => {
+  try {
+    if (!db || memoryMode !== "postgresql") return res.json({ logs: [] });
+
+    const result = await db.query(
+      "SELECT * FROM audit_log WHERE entity_id = $1 ORDER BY timestamp DESC LIMIT 100",
+      [req.params.entityId]
+    );
+
+    // Timeline de la entidad
+    const timeline = result.rows.map(r => ({
+      timestamp: r.timestamp,
+      agent: r.agent,
+      action: r.action,
+      outcome: r.outcome,
+      autonomy: r.autonomy_mode,
+      message: r.message_sent,
+      duration_ms: r.duration_ms,
+    }));
+
+    res.json({
+      entity_id: req.params.entityId,
+      total_interactions: result.rowCount,
+      timeline,
+      agents_involved: [...new Set(result.rows.map(r => r.agent).filter(Boolean))],
+      last_interaction: result.rows[0]?.timestamp,
+    });
+  } catch (err) { next(err); }
+});
+
+// GET /audit/stats — estadísticas globales de auditoría
+app.get("/audit/stats", async (req, res, next) => {
+  try {
+    if (!db || memoryMode !== "postgresql") return res.json({ stats: {} });
+
+    const [totals, byAgent, byOutcome, byAutonomy, recent] = await Promise.all([
+      db.query("SELECT COUNT(*) as total, AVG(duration_ms) as avg_duration FROM audit_log"),
+      db.query("SELECT agent, COUNT(*) as count FROM audit_log WHERE agent IS NOT NULL GROUP BY agent ORDER BY count DESC"),
+      db.query("SELECT outcome, COUNT(*) as count FROM audit_log GROUP BY outcome"),
+      db.query("SELECT autonomy_mode, COUNT(*) as count FROM audit_log WHERE autonomy_mode IS NOT NULL GROUP BY autonomy_mode"),
+      db.query("SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT 5"),
     ]);
 
-    const entry = detail.entries?.[0] || {};
-    const ai = detail.analysis || {};
+    res.json({
+      total_decisions: parseInt(totals.rows[0].total),
+      avg_duration_ms: Math.round(parseFloat(totals.rows[0].avg_duration) || 0),
+      by_agent: byAgent.rows,
+      by_outcome: byOutcome.rows,
+      by_autonomy: byAutonomy.rows,
+      recent_decisions: recent.rows,
+    });
+  } catch (err) { next(err); }
+});
 
-    let html = '';
+// POST /audit/explain — Claude explica una decisión en lenguaje simple
+app.post("/audit/explain", async (req, res, next) => {
+  try {
+    const { trace_id, entity_id, context = "" } = req.body;
+    if (!trace_id && !entity_id) return res.status(400).json({ error: "trace_id o entity_id requerido" });
 
-    if (ai.resumen) {
-      html += `<div class="detail-section">
-        <div class="detail-section-title">🤖 Explicación IA</div>
-        <div class="ai-box">${ai.resumen}</div>
-        ${ai.accion_ejecutada ? `<div style="margin-top:8px;font-size:11px;color:var(--muted2)">→ ${ai.accion_ejecutada}</div>` : ''}
-        ${ai.recomendacion ? `<div style="margin-top:6px;font-size:11px;color:var(--accent2)">💡 ${ai.recomendacion}</div>` : ''}
-      </div>`;
-    }
+    const query = trace_id
+      ? "SELECT * FROM audit_log WHERE trace_id = $1 ORDER BY timestamp DESC LIMIT 10"
+      : "SELECT * FROM audit_log WHERE entity_id = $1 ORDER BY timestamp DESC LIMIT 10";
 
-    if (entry.message_sent) {
-      html += `<div class="detail-section">
-        <div class="detail-section-title">💬 Mensaje enviado</div>
-        <div class="message-box">"${entry.message_sent}"</div>
-      </div>`;
-    }
+    const result = await db.query(query, [trace_id || entity_id]);
+    if (!result.rows.length) return res.json({ explanation: "No se encontraron registros de auditoría." });
 
-    html += `<div class="detail-section">
-      <div class="detail-section-title">📋 Decisión</div>
-      ${entry.agent ? `<div class="detail-row"><span class="detail-key">Agente</span><span class="detail-val"><span class="badge badge-agent">${entry.agent}</span></span></div>` : ''}
-      ${entry.autonomy_mode ? `<div class="detail-row"><span class="detail-key">Autonomía</span><span class="detail-val"><span class="badge badge-${entry.autonomy_mode}">${entry.autonomy_mode}</span></span></div>` : ''}
-      ${entry.risk_level ? `<div class="detail-row"><span class="detail-key">Riesgo detectado</span><span class="detail-val"><span class="badge badge-${entry.risk_level==='high'?'error':entry.risk_level==='medium'?'pending':'success'}">${entry.risk_level}</span></span></div>` : ''}
-      ${entry.confidence ? `<div class="detail-row"><span class="detail-key">Confianza</span><span class="detail-val">${entry.confidence}</span></div>` : ''}
-      ${entry.duration_ms ? `<div class="detail-row"><span class="detail-key">Tiempo</span><span class="detail-val" style="font-family:var(--mono)">${entry.duration_ms}ms</span></div>` : ''}
-      ${entry.outcome ? `<div class="detail-row"><span class="detail-key">Resultado</span><span class="detail-val"><span class="badge badge-${entry.outcome==='success'?'success':'error'}">${entry.outcome}</span></span></div>` : ''}
-    </div>`;
+    const explanation = await claudeChat(
+      "Eres un auditor de sistemas IA que explica decisiones en lenguaje claro para ejecutivos no técnicos.",
+      `Explica qué hizo PrismDB con esta entidad/decisión.
+Registros: ${JSON.stringify(result.rows.slice(0, 5))}
+Contexto adicional: ${context}
 
-    if (entry.reasoning) {
-      html += `<div class="detail-section">
-        <div class="detail-section-title">💭 Razonamiento</div>
-        <div style="font-size:12px;color:var(--muted2);line-height:1.6">${entry.reasoning}</div>
-      </div>`;
-    }
+Responde en español, de forma clara y directa. Máximo 200 palabras.
+Incluye: qué pasó, por qué, qué información usó, qué hizo, y si fue la decisión correcta.`,
+      "claude-haiku-4-5-20251001", 400
+    );
 
-    if (entity && entity.timeline?.length > 1) {
-      html += `<div class="detail-section">
-        <div class="detail-section-title">📅 Historial de entidad (${entity.total_interactions} interacciones)</div>
-        ${entity.timeline.slice(0,6).map(t=>`
-          <div class="timeline-item">
-            <span class="tl-time">${new Date(t.timestamp).toLocaleString('es-CO',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</span>
-            <div class="tl-content">
-              ${t.agent?`<span class="badge badge-agent" style="margin-right:4px">${t.agent}</span>`:''}
-              ${t.action||''}
-              ${t.message?`<div style="font-size:10px;color:var(--muted);margin-top:2px;font-style:italic">"${t.message.slice(0,80)}..."</div>`:''}
-            </div>
-          </div>`).join('')}
-      </div>`;
-    }
+    res.json({
+      trace_id,
+      entity_id,
+      explanation,
+      records_analyzed: result.rowCount,
+    });
+  } catch (err) { next(err); }
+});
 
-    document.getElementById('detail-body').innerHTML = html;
-  } catch(e) {
-    document.getElementById('detail-body').innerHTML = '<div class="empty">Error cargando el detalle.</div>';
-  }
-}
+// POST /audit/log — registrar manualmente una entrada de auditoría
+app.post("/audit/log", async (req, res, next) => {
+  try {
+    await auditLog({ ...req.body, source: "manual" });
+    res.json({ ok: true, message: "Entrada de auditoría registrada" });
+  } catch (err) { next(err); }
+});
 
-function closeDetail() {
-  document.getElementById('detail-overlay').classList.remove('open');
-}
+// GET /audit/export — exportar auditoría como CSV
+app.get("/audit/export", async (req, res, next) => {
+  try {
+    if (!db || memoryMode !== "postgresql") return res.status(503).json({ error: "Requiere PostgreSQL" });
 
-function clearFilters() {
-  ['f-agent','f-outcome','f-entity','f-autonomy'].forEach(id => {
-    const el = document.getElementById(id);
-    el.value = '';
-  });
-  loadLogs();
-}
+    const { from, to, agent } = req.query;
+    let query = "SELECT trace_id, timestamp, event_type, action, outcome, entity_id, agent, reasoning, action_taken, message_sent, autonomy_mode, duration_ms FROM audit_log WHERE 1=1";
+    const params = [];
 
-function exportCSV() {
-  const agent = document.getElementById('f-agent').value;
-  let url = API + '/audit/export?';
-  if (agent) url += `agent=${agent}`;
-  window.open(url, '_blank');
-}
+    if (from)  { params.push(from);  query += ` AND timestamp >= $${params.length}`; }
+    if (to)    { params.push(to);    query += ` AND timestamp <= $${params.length}`; }
+    if (agent) { params.push(agent); query += ` AND agent = $${params.length}`; }
 
-async function loadAll() {
-  await Promise.all([checkHealth(), loadStats(), loadLogs()]);
-}
+    query += " ORDER BY timestamp DESC LIMIT 1000";
+    const result = await db.query(query, params);
 
-loadAll();
-setInterval(loadAll, 30000);
-</script>
-</body>
-</html>
+    const headers = ["trace_id","timestamp","event_type","action","outcome","entity_id","agent","reasoning","action_taken","message_sent","autonomy_mode","duration_ms"];
+    const csv = [
+      headers.join(","),
+      ...result.rows.map(r =>
+        headers.map(h => `"${(r[h] || "").toString().replace(/"/g, '""')}"`).join(",")
+      )
+    ].join("\n");
+
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", `attachment; filename="prismdb-audit-${Date.now()}.csv"`);
+    res.send(csv);
+  } catch (err) { next(err); }
+});     
