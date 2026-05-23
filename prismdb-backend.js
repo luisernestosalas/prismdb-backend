@@ -20,7 +20,6 @@ dotenv.config();
 //  Evento → Clasificación → Matriz autonomía → Agente → Memoria
 // ═══════════════════════════════════════════════════════════
 
-import pg from "pg";
 
 // ── CONFIG ────────────────────────────────────────────────
 const ANTHROPIC_KEY  = process.env.ANTHROPIC_API_KEY;
