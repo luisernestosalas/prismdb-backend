@@ -2152,4 +2152,322 @@ app.get("/audit/export", async (req, res, next) => {
     res.setHeader("Content-Disposition", `attachment; filename="prismdb-audit-${Date.now()}.csv"`);
     res.send(csv);
   } catch (err) { next(err); }
-});     
+}); 
+// ═══════════════════════════════════════════════════════════
+//  PrismDB — pgvector / Memoria Semántica
+//  Embeddings con Gemini text-embedding-004
+//  Búsqueda por similitud semántica en toda la memoria
+//
+//  AGREGAR AL FINAL DE prismdb-backend.js
+//  (antes del error handler)
+// ═══════════════════════════════════════════════════════════
+
+// ── INICIALIZAR TABLAS DE EMBEDDINGS ────────────────────
+async function initVectorTables() {
+  if (!db || memoryMode !== "postgresql") return;
+  await db.query(`
+    -- Activar extensión pgvector
+    CREATE EXTENSION IF NOT EXISTS vector;
+
+    -- Tabla de chunks de conocimiento con embeddings
+    CREATE TABLE IF NOT EXISTS knowledge_chunks (
+      id          SERIAL PRIMARY KEY,
+      entity_id   TEXT,
+      entity_type TEXT,
+      content     TEXT NOT NULL,
+      summary     TEXT,
+      embedding   vector(768),
+      metadata    JSONB DEFAULT '{}',
+      agent       TEXT,
+      created_at  TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- Índice para búsqueda por similitud coseno
+    CREATE INDEX IF NOT EXISTS knowledge_embedding_idx
+      ON knowledge_chunks
+      USING ivfflat (embedding vector_cosine_ops)
+      WITH (lists = 100);
+
+    -- Índice por entidad
+    CREATE INDEX IF NOT EXISTS knowledge_entity_idx
+      ON knowledge_chunks(entity_id);
+
+    -- Tabla de patrones detectados entre entidades
+    CREATE TABLE IF NOT EXISTS patterns (
+      id          SERIAL PRIMARY KEY,
+      pattern     TEXT NOT NULL,
+      description TEXT,
+      embedding   vector(768),
+      examples    JSONB DEFAULT '[]',
+      confidence  NUMERIC DEFAULT 0,
+      agent       TEXT,
+      created_at  TIMESTAMPTZ DEFAULT NOW()
+    );
+  `).catch(e => console.error("[VECTOR INIT]", e.message));
+  console.log("✅ pgvector activo — Memoria semántica lista");
+}
+
+setTimeout(initVectorTables, 5000);
+
+// ══════════════════════════════════════════════════════════
+//  GENERAR EMBEDDINGS CON GEMINI
+// ══════════════════════════════════════════════════════════
+async function generateEmbedding(text) {
+  try {
+    const geminiKey = process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY;
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${geminiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "models/text-embedding-004",
+          content: { parts: [{ text: text.slice(0, 2000) }] },
+          taskType: "SEMANTIC_SIMILARITY"
+        })
+      }
+    );
+    const data = await res.json();
+    return data.embedding?.values || null;
+  } catch (e) {
+    console.error("[EMBEDDING ERROR]", e.message);
+    return null;
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  GUARDAR CHUNK EN MEMORIA SEMÁNTICA
+// ══════════════════════════════════════════════════════════
+async function saveKnowledge(entityId, entityType, content, metadata = {}, agent = "system") {
+  if (!db || memoryMode !== "postgresql") return null;
+
+  const embedding = await generateEmbedding(content);
+  if (!embedding) return null;
+
+  // Generar resumen corto con Gemini
+  let summary = content.slice(0, 100);
+  try {
+    const geminiKey = process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY;
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: `Resume en máximo 20 palabras: ${content}` }] }],
+          generationConfig: { maxOutputTokens: 50 }
+        })
+      }
+    );
+    const data = await res.json();
+    summary = data.candidates?.[0]?.content?.parts?.[0]?.text || summary;
+  } catch {}
+
+  const result = await db.query(
+    `INSERT INTO knowledge_chunks (entity_id, entity_type, content, summary, embedding, metadata, agent)
+     VALUES ($1, $2, $3, $4, $5::vector, $6, $7) RETURNING id`,
+    [entityId, entityType, content, summary.trim(), JSON.stringify(embedding), metadata, agent]
+  ).catch(e => { console.error("[SAVE KNOWLEDGE]", e.message); return null; });
+
+  return result?.rows?.[0]?.id;
+}
+
+// ══════════════════════════════════════════════════════════
+//  BÚSQUEDA SEMÁNTICA
+// ══════════════════════════════════════════════════════════
+async function semanticSearch(query, options = {}) {
+  if (!db || memoryMode !== "postgresql") return [];
+
+  const {
+    limit = 5,
+    threshold = 0.7,
+    entityType,
+    agent,
+  } = options;
+
+  const embedding = await generateEmbedding(query);
+  if (!embedding) return [];
+
+  let sql = `
+    SELECT
+      id, entity_id, entity_type, content, summary, metadata, agent, created_at,
+      1 - (embedding <=> $1::vector) AS similarity
+    FROM knowledge_chunks
+    WHERE 1 - (embedding <=> $1::vector) > $2
+  `;
+  const params = [JSON.stringify(embedding), threshold];
+
+  if (entityType) { params.push(entityType); sql += ` AND entity_type = $${params.length}`; }
+  if (agent)      { params.push(agent);      sql += ` AND agent = $${params.length}`; }
+
+  params.push(limit);
+  sql += ` ORDER BY similarity DESC LIMIT $${params.length}`;
+
+  const result = await db.query(sql, params).catch(e => {
+    console.error("[SEMANTIC SEARCH]", e.message);
+    return { rows: [] };
+  });
+
+  return result.rows;
+}
+
+// ══════════════════════════════════════════════════════════
+//  RUTAS HTTP — pgvector
+// ══════════════════════════════════════════════════════════
+
+// POST /memory/embed — guardar texto en memoria semántica
+app.post("/memory/embed", async (req, res, next) => {
+  try {
+    const { entity_id, entity_type = "contact", content, metadata = {}, agent = "system" } = req.body;
+    if (!entity_id || !content) return res.status(400).json({ error: "entity_id y content requeridos" });
+
+    const id = await saveKnowledge(entity_id, entity_type, content, metadata, agent);
+    if (!id) return res.status(503).json({ error: "pgvector no disponible o embedding falló" });
+
+    res.json({ ok: true, id, entity_id, summary: content.slice(0, 80) + "..." });
+  } catch (err) { next(err); }
+});
+
+// POST /memory/search — búsqueda semántica
+app.post("/memory/search", async (req, res, next) => {
+  try {
+    const { query, limit = 5, threshold = 0.6, entity_type, agent } = req.body;
+    if (!query) return res.status(400).json({ error: "query requerido" });
+
+    const results = await semanticSearch(query, { limit, threshold, entityType: entity_type, agent });
+
+    // IA interpreta los resultados
+    let interpretation = null;
+    if (results.length) {
+      const geminiKey = process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY;
+      try {
+        const aiRes = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: `Analiza estos resultados de búsqueda semántica y da un insight en 2 oraciones.
+Query: "${query}"
+Resultados: ${JSON.stringify(results.map(r => ({ summary: r.summary, similarity: r.similarity, entity: r.entity_id })))}
+Responde directamente sin preámbulo.` }] }],
+              generationConfig: { maxOutputTokens: 150 }
+            })
+          }
+        );
+        const aiData = await aiRes.json();
+        interpretation = aiData.candidates?.[0]?.content?.parts?.[0]?.text || null;
+      } catch {}
+    }
+
+    res.json({
+      query,
+      results,
+      total: results.length,
+      interpretation,
+    });
+  } catch (err) { next(err); }
+});
+
+// POST /memory/similar — encontrar entidades similares a una dada
+app.post("/memory/similar", async (req, res, next) => {
+  try {
+    const { entity_id, limit = 5 } = req.body;
+    if (!entity_id) return res.status(400).json({ error: "entity_id requerido" });
+
+    if (!db || memoryMode !== "postgresql") return res.json({ similar: [] });
+
+    // Obtener embeddings de esta entidad
+    const entity = await db.query(
+      "SELECT content FROM knowledge_chunks WHERE entity_id = $1 ORDER BY created_at DESC LIMIT 1",
+      [entity_id]
+    );
+
+    if (!entity.rows.length) return res.json({ similar: [], message: "Entidad sin embeddings aún" });
+
+    // Buscar similares excluyendo la misma entidad
+    const embedding = await generateEmbedding(entity.rows[0].content);
+    if (!embedding) return res.json({ similar: [] });
+
+    const result = await db.query(`
+      SELECT
+        entity_id, entity_type, summary,
+        1 - (embedding <=> $1::vector) AS similarity
+      FROM knowledge_chunks
+      WHERE entity_id != $2
+        AND 1 - (embedding <=> $1::vector) > 0.6
+      GROUP BY entity_id, entity_type, summary, embedding
+      ORDER BY similarity DESC
+      LIMIT $3
+    `, [JSON.stringify(embedding), entity_id, limit]).catch(() => ({ rows: [] }));
+
+    res.json({ entity_id, similar: result.rows });
+  } catch (err) { next(err); }
+});
+
+// POST /memory/patterns — detectar patrones entre entidades
+app.post("/memory/patterns", async (req, res, next) => {
+  try {
+    const { context = "ventas", limit = 10 } = req.body;
+    if (!db || memoryMode !== "postgresql") return res.json({ patterns: [] });
+
+    // Obtener chunks recientes
+    const chunks = await db.query(
+      "SELECT entity_id, content, summary, agent FROM knowledge_chunks ORDER BY created_at DESC LIMIT $1",
+      [limit * 3]
+    );
+
+    if (!chunks.rows.length) return res.json({ patterns: [], message: "Sin datos suficientes aún" });
+
+    // IA detecta patrones
+    const geminiKey = process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY;
+    const aiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: `Analiza estos registros de memoria empresarial y detecta patrones útiles para ${context}.
+Datos: ${JSON.stringify(chunks.rows.slice(0, 20))}
+
+Responde SOLO JSON:
+{"patterns":[{"patron":"descripción del patrón","frecuencia":"alta|media|baja","insight":"qué significa para el negocio","accion":"qué hacer con este patrón"}]}` }] }],
+          generationConfig: { maxOutputTokens: 600 }
+        })
+      }
+    );
+    const aiData = await aiRes.json();
+    const text = aiData.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+
+    let parsed = { patterns: [] };
+    try { parsed = JSON.parse(text.replace(/```json|```/g, "").trim()); } catch {}
+
+    res.json({ context, patterns: parsed.patterns || [], total_analyzed: chunks.rowCount });
+  } catch (err) { next(err); }
+});
+
+// GET /memory/stats/vector — estadísticas de la memoria semántica
+app.get("/memory/stats/vector", async (_req, res, next) => {
+  try {
+    if (!db || memoryMode !== "postgresql") return res.json({ stats: {}, mode: "in-memory" });
+
+    const [total, byType, byAgent, recent] = await Promise.all([
+      db.query("SELECT COUNT(*) as total FROM knowledge_chunks"),
+      db.query("SELECT entity_type, COUNT(*) as count FROM knowledge_chunks GROUP BY entity_type ORDER BY count DESC"),
+      db.query("SELECT agent, COUNT(*) as count FROM knowledge_chunks GROUP BY agent ORDER BY count DESC"),
+      db.query("SELECT entity_id, summary, created_at FROM knowledge_chunks ORDER BY created_at DESC LIMIT 5"),
+    ]);
+
+    res.json({
+      total_chunks: parseInt(total.rows[0].total),
+      by_type: byType.rows,
+      by_agent: byAgent.rows,
+      recent: recent.rows,
+    });
+  } catch (err) { next(err); }
+});
+
+// Exportar funciones para uso interno
+globalThis.saveKnowledge = saveKnowledge;
+globalThis.semanticSearch = semanticSearch;
+globalThis.generateEmbedding = generateEmbedding;
