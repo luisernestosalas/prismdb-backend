@@ -8,512 +8,9 @@ import cors from "cors";
 import helmet from "helmet";
 import dotenv from "dotenv";
 import pg from "pg";
+import { processEvent, startEventBus, EVENT_TYPES, autonomyDecision, classifyEvent } from "./router.js";
 
 dotenv.config();
-
-// ══ ROUTER FUNCTIONS ══
-// ═══════════════════════════════════════════════════════════
-//  PrismDB — AI Router v1.0
-//  Event Bus · Autonomy Matrix · Agent Orchestration
-//  
-//  Flujo:
-//  Evento → Clasificación → Matriz autonomía → Agente → Memoria
-// ═══════════════════════════════════════════════════════════
-
-
-// ── CONFIG ────────────────────────────────────────────────
-const ANTHROPIC_KEY  = process.env.ANTHROPIC_API_KEY;
-const TWILIO_SID     = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_TOKEN   = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_FROM    = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
-const NOTIFY_PHONE   = process.env.NOTIFY_PHONE; // número del responsable humano
-
-// ══════════════════════════════════════════════════════════
-//  TIPOS DE EVENTOS
-//  Cada fuente tiene su schema de entrada
-// ══════════════════════════════════════════════════════════
-const EVENT_TYPES = {
-  // WhatsApp
-  WHATSAPP_INBOUND:    "whatsapp.inbound",       // cliente escribió
-  WHATSAPP_NO_REPLY:   "whatsapp.no_reply",      // no respondió en X horas
-
-  // Ventas / CRM
-  LEAD_NEW:            "lead.new",               // lead nuevo cargado
-  LEAD_QUALIFIED:      "lead.qualified",         // SDR calificó lead
-  DEAL_STALLED:        "deal.stalled",           // deal sin movimiento
-  DEAL_AT_RISK:        "deal.at_risk",           // probabilidad bajó
-  DEAL_CLOSED:         "deal.closed",            // deal cerrado
-
-  // Pagos
-  PAYMENT_SUCCESS:     "payment.success",        // pago exitoso
-  PAYMENT_FAILED:      "payment.failed",         // pago fallido
-  PAYMENT_OVERDUE:     "payment.overdue",        // pago vencido
-
-  // Ventas activas
-  CAMPAIGN_TRIGGER:    "campaign.trigger",       // campaña programada
-  CLIENT_INACTIVE:     "client.inactive",        // cliente inactivo +14d
-  CATALOG_REQUEST:     "catalog.request",        // pidió catálogo
-
-  // Talento / RRHH
-  CANDIDATE_REPLIED:   "candidate.replied",      // candidato respondió
-  CANDIDATE_GHOSTED:   "candidate.ghosted",      // candidato no respondió
-  VACANCY_OPENED:      "vacancy.opened",         // nueva vacante
-
-  // Finanzas
-  REVENUE_ALERT:       "revenue.alert",          // revenue por debajo de meta
-  FORECAST_READY:      "forecast.ready",         // predicción generada
-
-  // Sistema
-  SCHEDULED_TASK:      "system.scheduled",       // tarea programada
-  MANUAL_TRIGGER:      "system.manual",          // trigger manual por humano
-};
-
-// ══════════════════════════════════════════════════════════
-//  MATRIZ DE AUTONOMÍA
-//  Define si el router actúa solo, actúa+notifica, o espera
-//
-//  Dimensiones:
-//  - urgency:    high / medium / low
-//  - confidence: high / medium / low
-//  - risk:       high / medium / low  (riesgo económico o reputacional)
-//
-//  Resultado:
-//  - "auto"     → agente actúa solo
-//  - "notify"   → agente actúa + notifica al humano
-//  - "approve"  → notifica y espera aprobación antes de actuar
-// ══════════════════════════════════════════════════════════
-function autonomyDecision({ urgency, confidence, risk, amount = 0 }) {
-  // Riesgo económico alto → siempre pedir aprobación
-  if (amount > 2000)            return "approve";
-  if (risk === "high")          return "approve";
-
-  // Alta urgencia + alta confianza → actúa solo
-  if (urgency === "high" && confidence === "high" && risk === "low")
-                                return "auto";
-
-  // Alta urgencia pero baja confianza → actúa + notifica
-  if (urgency === "high" && confidence === "low")
-                                return "notify";
-
-  // Confianza alta, urgencia normal → actúa solo
-  if (confidence === "high" && risk === "low")
-                                return "auto";
-
-  // Confianza media → actúa + notifica
-  if (confidence === "medium")  return "notify";
-
-  // Baja confianza o riesgo medio → notifica, espera
-  return "approve";
-}
-
-// ══════════════════════════════════════════════════════════
-//  CLASIFICADOR DE EVENTOS
-//  Claude analiza el evento y decide:
-//  - qué agente actúa
-//  - urgencia / confianza / riesgo
-//  - acción recomendada
-// ══════════════════════════════════════════════════════════
-async function classifyEvent(event, memory = {}) {
-  const prompt = `Eres el AI Router de PrismDB — el cerebro central del sistema operativo empresarial.
-
-Analiza este evento y decide cómo responder. Devuelve SOLO JSON válido.
-
-AGENTES DISPONIBLES:
-- sdr: prospección, primer contacto, calificación de leads nuevos
-- revenue: ventas activas, seguimiento, manejo de objeciones, cierre, deals en riesgo
-- talent: reclutamiento, candidatos, vacantes
-- finance: alertas financieras, forecasts, pagos, revenue
-- campaign: campañas masivas, catálogos, clientes inactivos
-- none: evento informativo, no requiere acción de agente
-
-REGLAS:
-- Si hay riesgo económico >$1000, sube el risk a "high"
-- Si el cliente ya compró antes, sube confidence
-- Si es primer contacto, baja confidence
-- Pagos fallidos siempre son urgency "high"
-- Deals cerrados siempre notifican a humano
-
-EVENTO:
-${JSON.stringify(event, null, 2)}
-
-MEMORIA DEL CONTACTO:
-${JSON.stringify(memory, null, 2)}
-
-RESPONDE CON ESTE JSON EXACTO:
-{
-  "agent": "sdr|revenue|talent|finance|campaign|none",
-  "urgency": "high|medium|low",
-  "confidence": "high|medium|low",
-  "risk": "high|medium|low",
-  "amount": 0,
-  "action": "descripción de qué debe hacer el agente en una frase",
-  "reason": "por qué este agente y no otro",
-  "context_needed": ["lista", "de", "datos", "relevantes", "de", "memoria"],
-  "notify_message": "mensaje corto para notificar al humano si aplica"
-}`;
-
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": ANTHROPIC_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 600,
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
-
-  const data = await res.json();
-  const text = data.content?.[0]?.text || "{}";
-  return JSON.parse(text.replace(/```json|```/g, "").trim());
-}
-
-// ══════════════════════════════════════════════════════════
-//  EJECUTORES DE AGENTES
-//  Cada agente recibe el evento + contexto completo
-// ══════════════════════════════════════════════════════════
-async function runAgent(agentName, event, memory, classification) {
-  const systemPrompts = {
-    sdr: `Eres el Agente SDR de PrismDB. Especialista en prospección B2B para LATAM.
-Objetivo: calificar leads, generar interés, conseguir reunión o demo.
-Tono: directo, cálido, profesional. WhatsApp: máximo 160 chars.
-Usa el historial del contacto para personalizar cada mensaje.`,
-
-    revenue: `Eres el Agente Revenue de PrismDB. Especialista en cierre de ventas B2B.
-Objetivo: avanzar deals al cierre, manejar objeciones, generar urgencia.
-Tienes el historial completo. Cada mensaje debe tener valor claro.
-WhatsApp: máximo 200 chars.`,
-
-    talent: `Eres el Agente Talent de PrismDB. Especialista en reclutamiento.
-Objetivo: identificar candidatos, generar interés en vacantes.
-Tono: empático, motivador, claro sobre la oportunidad.
-WhatsApp: máximo 180 chars.`,
-
-    finance: `Eres el Agente Finance de PrismDB. Especialista en análisis financiero.
-Objetivo: generar alertas, forecasts y recomendaciones de revenue.
-Tono: preciso, ejecutivo, orientado a acción.
-Responde con análisis claro y acción recomendada.`,
-
-    campaign: `Eres el Agente Campaign de PrismDB. Especialista en ventas activas y campañas.
-Objetivo: reactivar clientes, enviar catálogos personalizados, gestionar pedidos.
-Tono: comercial, personalizado, con propuesta de valor clara.
-WhatsApp: máximo 200 chars.`,
-  };
-
-  const userContent = `EVENTO: ${JSON.stringify(event)}
-HISTORIAL: ${JSON.stringify(memory)}
-ACCIÓN REQUERIDA: ${classification.action}
-CONTEXTO CLAVE: ${classification.context_needed?.join(", ")}
-
-Genera la respuesta/acción. Si es un mensaje WhatsApp, devuelve SOLO el texto del mensaje.
-Si es un análisis o reporte, devuelve el contenido completo.`;
-
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": ANTHROPIC_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: agentName === "finance" ? "claude-sonnet-4-20250514" : "claude-haiku-4-5-20251001",
-      max_tokens: agentName === "finance" ? 1000 : 400,
-      system: systemPrompts[agentName] || systemPrompts.sdr,
-      messages: [{ role: "user", content: userContent }],
-    }),
-  });
-
-  const data = await res.json();
-  return data.content?.[0]?.text || "";
-}
-
-// ══════════════════════════════════════════════════════════
-//  NOTIFICADOR HUMANO
-//  Avisa al responsable cuando el router decide notificar
-// ══════════════════════════════════════════════════════════
-async function notifyHuman(message, event, classification) {
-  if (!NOTIFY_PHONE) return { ok: false, reason: "NOTIFY_PHONE no configurado" };
-
-  const text = `🤖 *PrismDB Router*\n\n` +
-    `*Evento:* ${event.type}\n` +
-    `*Entidad:* ${event.entityId || "—"}\n` +
-    `*Agente:* ${classification.agent.toUpperCase()}\n` +
-    `*Urgencia:* ${classification.urgency}\n\n` +
-    `${classification.notify_message || message}\n\n` +
-    `_${new Date().toLocaleString("es-CO")}_`;
-
-  const credentials = Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString("base64");
-  const phone = NOTIFY_PHONE.startsWith("whatsapp:") ? NOTIFY_PHONE : `whatsapp:+57${NOTIFY_PHONE.replace(/\D/g, "")}`;
-
-  const res = await fetch(
-    `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`,
-    {
-      method: "POST",
-      headers: { Authorization: `Basic ${credentials}`, "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ From: TWILIO_FROM, To: phone, Body: text }),
-    }
-  );
-  return await res.json();
-}
-
-// ══════════════════════════════════════════════════════════
-//  SEND WHATSAPP
-// ══════════════════════════════════════════════════════════
-async function sendWhatsApp(to, message) {
-  const phone = to.startsWith("whatsapp:") ? to : `whatsapp:+57${to.replace(/\D/g, "")}`;
-  const credentials = Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString("base64");
-  const res = await fetch(
-    `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`,
-    {
-      method: "POST",
-      headers: { Authorization: `Basic ${credentials}`, "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ From: TWILIO_FROM, To: phone, Body: message }),
-    }
-  );
-  return await res.json();
-}
-
-// ══════════════════════════════════════════════════════════
-//  AI ROUTER — FUNCIÓN PRINCIPAL
-//  Orquesta todo el flujo completo
-// ══════════════════════════════════════════════════════════
-async function processEvent(event, db = null) {
-  const startTime = Date.now();
-  const result = {
-    event_id: `evt_${Date.now()}`,
-    event_type: event.type,
-    entity_id: event.entityId,
-    timestamp: new Date().toISOString(),
-    classification: null,
-    autonomy: null,
-    agent_response: null,
-    actions_taken: [],
-    memory_updated: false,
-    duration_ms: 0,
-  };
-
-  try {
-    // 1. Leer memoria del contacto
-    let memory = {};
-    if (db) {
-      const r = await db.query("SELECT data FROM memory WHERE entity_id = $1", [event.entityId]).catch(() => ({ rows: [] }));
-      memory = r.rows[0]?.data || {};
-    }
-
-    // 2. Clasificar el evento con Claude
-    result.classification = await classifyEvent(event, memory);
-    const cls = result.classification;
-
-    // Si no hay agente que actúe, registrar y salir
-    if (cls.agent === "none") {
-      result.actions_taken.push("event_logged");
-      result.duration_ms = Date.now() - startTime;
-      await logRouterEvent(db, result);
-      return result;
-    }
-
-    // 3. Decidir autonomía
-    result.autonomy = autonomyDecision({
-      urgency: cls.urgency,
-      confidence: cls.confidence,
-      risk: cls.risk,
-      amount: cls.amount || 0,
-    });
-
-    // 4. Si necesita aprobación → solo notificar y esperar
-    if (result.autonomy === "approve") {
-      await notifyHuman(
-        `Evento requiere tu aprobación: ${cls.action}`,
-        event,
-        cls
-      ).catch(() => {});
-      result.actions_taken.push("human_notified_awaiting_approval");
-      result.duration_ms = Date.now() - startTime;
-      await logRouterEvent(db, result);
-      return result;
-    }
-
-    // 5. Ejecutar el agente
-    result.agent_response = await runAgent(cls.agent, event, memory, cls);
-
-    // 6. Acciones según tipo de evento
-    const whatsappAgents = ["sdr", "revenue", "talent", "campaign"];
-    const shouldSendWA = whatsappAgents.includes(cls.agent) &&
-      (event.type.startsWith("whatsapp.") || event.phone || event.entityId?.includes("57"));
-
-    if (shouldSendWA && result.agent_response) {
-      const phone = event.phone || event.entityId;
-      if (phone) {
-        await sendWhatsApp(phone, result.agent_response).catch(() => {});
-        result.actions_taken.push("whatsapp_sent");
-      }
-    }
-
-    // 7. Notificar al humano si autonomy === "notify"
-    if (result.autonomy === "notify") {
-      await notifyHuman(result.agent_response, event, cls).catch(() => {});
-      result.actions_taken.push("human_notified");
-    }
-
-    // 8. Actualizar memoria
-    if (db && event.entityId) {
-      const newMemory = {
-        ...memory,
-        last_event: event.type,
-        last_agent: cls.agent,
-        last_action: cls.action,
-        last_response: result.agent_response?.slice(0, 200),
-        [`${cls.agent}_last_run`]: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      };
-
-      // Métricas específicas por tipo de evento
-      if (event.type === "payment.success")  newMemory.total_paid = (memory.total_paid || 0) + (event.amount || 0);
-      if (event.type === "deal.closed")      newMemory.deals_closed = (memory.deals_closed || 0) + 1;
-      if (event.type === "whatsapp.inbound") newMemory.messages_received = (memory.messages_received || 0) + 1;
-
-      await db.query(
-        `INSERT INTO memory (entity_id, entity_type, data)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (entity_id) DO UPDATE SET data = $3, updated_at = NOW()`,
-        [event.entityId, event.entityType || "contact", newMemory]
-      ).catch(() => {});
-
-      result.memory_updated = true;
-    }
-
-    result.actions_taken.push(`agent_${cls.agent}_executed`);
-    result.duration_ms = Date.now() - startTime;
-    await logRouterEvent(db, result);
-    return result;
-
-  } catch (err) {
-    result.error = err.message;
-    result.duration_ms = Date.now() - startTime;
-    await logRouterEvent(db, result).catch(() => {});
-    throw err;
-  }
-}
-
-// ══════════════════════════════════════════════════════════
-//  LOGGER DE EVENTOS DEL ROUTER
-// ══════════════════════════════════════════════════════════
-async function logRouterEvent(db, result) {
-  if (!db) return;
-  await db.query(
-    "INSERT INTO events (type, entity_id, payload) VALUES ($1, $2, $3)",
-    ["router.processed", result.entity_id, result]
-  ).catch(() => {});
-}
-
-// ══════════════════════════════════════════════════════════
-//  EVENT BUS — SCHEDULER INTERNO
-//  Genera eventos proactivos periódicamente
-// ══════════════════════════════════════════════════════════
-function startEventBus(db, intervalMs = 60000) {
-  console.log("🚌 Event Bus iniciado — revisando cada", intervalMs / 1000, "segundos");
-
-  setInterval(async () => {
-    if (!db) return;
-    const now = new Date();
-
-    try {
-      // 1. Detectar clientes inactivos (sin contacto en 14 días)
-      const inactive = await db.query(`
-        SELECT entity_id, data FROM memory
-        WHERE entity_type = 'contact'
-          AND (data->>'last_event') IS NOT NULL
-          AND updated_at < NOW() - INTERVAL '14 days'
-          AND (data->>'client_inactive_notified') IS DISTINCT FROM 'true'
-        LIMIT 10
-      `).catch(() => ({ rows: [] }));
-
-      for (const row of inactive.rows) {
-        await processEvent({
-          type: EVENT_TYPES.CLIENT_INACTIVE,
-          entityId: row.entity_id,
-          entityType: "contact",
-          phone: row.data?.phone,
-          data: row.data,
-          triggeredBy: "event_bus",
-        }, db).catch(console.error);
-
-        // Marcar como notificado para no repetir
-        await db.query(
-          `UPDATE memory SET data = data || '{"client_inactive_notified":"true"}', updated_at = NOW()
-           WHERE entity_id = $1`, [row.entity_id]
-        ).catch(() => {});
-      }
-
-      // 2. Detectar deals estancados (sin movimiento en 5 días)
-      const stalled = await db.query(`
-        SELECT entity_id, data FROM memory
-        WHERE entity_type IN ('lead', 'deal')
-          AND data->>'stage' IN ('calificado', 'negociacion')
-          AND updated_at < NOW() - INTERVAL '5 days'
-          AND (data->>'stalled_notified') IS DISTINCT FROM 'true'
-        LIMIT 10
-      `).catch(() => ({ rows: [] }));
-
-      for (const row of stalled.rows) {
-        await processEvent({
-          type: EVENT_TYPES.DEAL_STALLED,
-          entityId: row.entity_id,
-          entityType: "deal",
-          phone: row.data?.phone,
-          data: row.data,
-          triggeredBy: "event_bus",
-        }, db).catch(console.error);
-
-        await db.query(
-          `UPDATE memory SET data = data || '{"stalled_notified":"true"}', updated_at = NOW()
-           WHERE entity_id = $1`, [row.entity_id]
-        ).catch(() => {});
-      }
-
-      // 3. Detectar candidatos sin respuesta (48h)
-      const ghosted = await db.query(`
-        SELECT entity_id, data FROM memory
-        WHERE entity_type = 'candidate'
-          AND data->>'talent_stage' = 'contactado'
-          AND updated_at < NOW() - INTERVAL '48 hours'
-          AND (data->>'ghosted_notified') IS DISTINCT FROM 'true'
-        LIMIT 10
-      `).catch(() => ({ rows: [] }));
-
-      for (const row of ghosted.rows) {
-        await processEvent({
-          type: EVENT_TYPES.CANDIDATE_GHOSTED,
-          entityId: row.entity_id,
-          entityType: "candidate",
-          phone: row.data?.phone,
-          data: row.data,
-          triggeredBy: "event_bus",
-        }, db).catch(console.error);
-
-        await db.query(
-          `UPDATE memory SET data = data || '{"ghosted_notified":"true"}', updated_at = NOW()
-           WHERE entity_id = $1`, [row.entity_id]
-        ).catch(() => {});
-      }
-
-      // 4. Log del ciclo del bus
-      if (inactive.rows.length + stalled.rows.length + ghosted.rows.length > 0) {
-        console.log(`[EVENT BUS] ${now.toISOString()} — inactivos:${inactive.rows.length} stalled:${stalled.rows.length} ghosted:${ghosted.rows.length}`);
-      }
-
-    } catch (err) {
-      console.error("[EVENT BUS ERROR]", err.message);
-    }
-  }, intervalMs);
-}
-
-// export default { processEvent, classifyEvent, autonomyDecision, startEventBus, EVENT_TYPES };
-
-// ══ END ROUTER ══
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -2270,17 +1767,548 @@ app.post("/graph/bulk", async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── Error handler ─────────────────────────────────────────
-app.use((err, _req, res, _next) => {
-  console.error("[ERROR]", err.message);
-  res.status(500).json({ error: err.message || "Error interno" });
+
+
+// ═══════════════════════════════════════════════════════════
+//  PrismDB — Módulo Ventas Activas
+//  Carga de bases · Catálogos · Campañas · Clientes inactivos
+//
+//  AGREGAR AL FINAL DE prismdb-backend.js
+//  (antes del error handler)
+// ═══════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════
+//  HELPERS INTERNOS
+// ══════════════════════════════════════════════════════════
+
+// Parsear CSV simple (sin librerías)
+function parseCSV(text) {
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
+  return lines.slice(1).map(line => {
+    const vals = line.split(',').map(v => v.trim().replace(/"/g, ''));
+    const obj = {};
+    headers.forEach((h, i) => obj[h] = vals[i] || '');
+    return obj;
+  }).filter(r => Object.values(r).some(v => v));
+}
+
+// Normalizar campos de contacto (acepta columnas con distintos nombres)
+function normalizeContact(raw) {
+  const find = (...keys) => {
+    for (const k of keys) {
+      if (raw[k] !== undefined && raw[k] !== '') return raw[k];
+    }
+    return '';
+  };
+  return {
+    nombre:   find('nombre', 'name', 'cliente', 'razon_social', 'empresa'),
+    telefono: find('telefono', 'phone', 'celular', 'movil', 'whatsapp', 'tel'),
+    email:    find('email', 'correo', 'mail'),
+    empresa:  find('empresa', 'company', 'negocio', 'razon_social'),
+    ciudad:   find('ciudad', 'city', 'municipio'),
+    segmento: find('segmento', 'segment', 'categoria', 'tipo', 'grupo'),
+    notas:    find('notas', 'notes', 'observaciones', 'comentarios'),
+    ...raw,
+  };
+}
+
+// In-memory store para bases de datos cargadas (fallback si no hay DB)
+const activaStore = {
+  bases: {},       // id → { nombre, contactos[], created_at }
+  catalogos: {},   // id → { nombre, productos[], created_at }
+  campanas: {},    // id → { config, resultados[], created_at }
+};
+
+// ══════════════════════════════════════════════════════════
+//  1. BASES DE DATOS
+// ══════════════════════════════════════════════════════════
+
+// POST /activa/base/upload — subir base de datos (CSV text o JSON array)
+app.post("/activa/base/upload", async (req, res, next) => {
+  try {
+    const { nombre = "Base sin nombre", formato = "json", data, csv_text } = req.body;
+
+    let contactos = [];
+
+    if (formato === "csv" && csv_text) {
+      const raw = parseCSV(csv_text);
+      contactos = raw.map(normalizeContact);
+    } else if (Array.isArray(data)) {
+      contactos = data.map(normalizeContact);
+    } else {
+      return res.status(400).json({ error: "Envía 'data' (array JSON) o 'csv_text' con formato:'csv'" });
+    }
+
+    if (!contactos.length) return res.status(400).json({ error: "No se encontraron contactos válidos" });
+
+    const baseId = `base_${Date.now()}`;
+    const base = {
+      id: baseId,
+      nombre,
+      total: contactos.length,
+      contactos,
+      con_telefono: contactos.filter(c => c.telefono).length,
+      con_email: contactos.filter(c => c.email).length,
+      segmentos: [...new Set(contactos.map(c => c.segmento).filter(Boolean))],
+      created_at: new Date().toISOString(),
+    };
+
+    // Guardar en PostgreSQL si disponible
+    if (db && memoryMode === "postgresql") {
+      for (const contacto of contactos) {
+        const entityId = contacto.telefono || contacto.email || `${baseId}_${Math.random().toString(36).slice(2,8)}`;
+        await db.query(`
+          INSERT INTO memory (entity_id, entity_type, data)
+          VALUES ($1, 'activa_contact', $2)
+          ON CONFLICT (entity_id) DO UPDATE
+            SET data = memory.data || $2, updated_at = NOW()
+        `, [entityId, { ...contacto, base_id: baseId, base_nombre: nombre, loaded_at: new Date().toISOString() }])
+        .catch(() => {});
+      }
+    }
+
+    activaStore.bases[baseId] = base;
+
+    // Análisis IA de la base
+    const analisis = await claudeChat(
+      "Analista de bases de datos comerciales. Responde en JSON.",
+      `Analiza esta base de contactos y da recomendaciones. SOLO JSON:
+{"calidad":"alta|media|baja","completitud":85,"segmentos_detectados":[],"recomendacion_campana":"...","mensaje_tipo":"...","mejor_horario":"..."}
+Muestra (primeros 5): ${JSON.stringify(contactos.slice(0,5))}
+Total: ${contactos.length} | Con teléfono: ${base.con_telefono} | Segmentos: ${base.segmentos.join(', ')||'sin segmentar'}`,
+      "claude-haiku-4-5-20251001", 400
+    ).catch(() => "{}");
+
+    let analisisObj = {};
+    try { analisisObj = JSON.parse(analisis.replace(/```json|```/g, "").trim()); } catch {}
+
+    res.status(201).json({ ok: true, base_id: baseId, ...base, analisis: analisisObj });
+  } catch (err) { next(err); }
 });
 
-app.listen(PORT, () => {
-  console.log(`✅ PrismDB v2.1 corriendo en http://localhost:${PORT}`);
-  console.log(`   Memory: ${memoryMode} | AI Router activo | Event Bus iniciando...`);
-  console.log(`   Módulos: SDR · Revenue · Ventas Activas · Talent · Finance · Enterprise Graph`);
+// GET /activa/base — listar todas las bases
+app.get("/activa/base", async (_req, res, next) => {
+  try {
+    const bases = Object.values(activaStore.bases).map(b => ({
+      id: b.id, nombre: b.nombre, total: b.total,
+      con_telefono: b.con_telefono, segmentos: b.segmentos, created_at: b.created_at,
+    }));
+    res.json({ bases, total: bases.length });
+  } catch (err) { next(err); }
 });
+
+// GET /activa/base/:id — detalle de una base
+app.get("/activa/base/:id", (req, res) => {
+  const base = activaStore.bases[req.params.id];
+  if (!base) return res.status(404).json({ error: "Base no encontrada" });
+  res.json(base);
+});
+
+// ══════════════════════════════════════════════════════════
+//  2. CATÁLOGOS
+// ══════════════════════════════════════════════════════════
+
+// POST /activa/catalogo — crear catálogo de productos
+app.post("/activa/catalogo", async (req, res, next) => {
+  try {
+    const { nombre = "Catálogo", productos = [], descripcion_empresa = "" } = req.body;
+
+    if (!productos.length) return res.status(400).json({ error: "productos[] requerido" });
+
+    const catalogoId = `cat_${Date.now()}`;
+
+    // Claude genera descripción optimizada para WhatsApp de cada producto
+    const productosOptimizados = await Promise.all(
+      productos.slice(0, 20).map(async (p) => {
+        const msg = await claudeChat(
+          "Experto en ventas por WhatsApp. Crea descripciones cortas, atractivas y con emoji. Máx 120 chars.",
+          `Producto: ${p.nombre} | Precio: ${p.precio || 'consultar'} | Descripción: ${p.descripcion || ''}
+Contexto empresa: ${descripcion_empresa}
+Devuelve SOLO el mensaje WhatsApp optimizado.`
+        ).catch(() => `${p.nombre} - $${p.precio || 'Consultar'}`);
+        return { ...p, mensaje_wa: msg.trim() };
+      })
+    );
+
+    const catalogo = {
+      id: catalogoId,
+      nombre,
+      descripcion_empresa,
+      productos: productosOptimizados,
+      total_productos: productosOptimizados.length,
+      created_at: new Date().toISOString(),
+    };
+
+    activaStore.catalogos[catalogoId] = catalogo;
+    res.status(201).json({ ok: true, catalogo_id: catalogoId, ...catalogo });
+  } catch (err) { next(err); }
+});
+
+// GET /activa/catalogo — listar catálogos
+app.get("/activa/catalogo", (_req, res) => {
+  const catalogos = Object.values(activaStore.catalogos).map(c => ({
+    id: c.id, nombre: c.nombre, total_productos: c.total_productos, created_at: c.created_at,
+  }));
+  res.json({ catalogos, total: catalogos.length });
+});
+
+// POST /activa/catalogo/extract — extraer catálogo desde URL (Instagram, web, etc.)
+app.post("/activa/catalogo/extract", async (req, res, next) => {
+  try {
+    const { url, nombre = "Catálogo extraído" } = req.body;
+    if (!url) return res.status(400).json({ error: "url requerida" });
+
+    const fcData = await (await fetch("https://api.firecrawl.dev/v1/scrape", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.FIRECRAWL_API_KEY}` },
+      body: JSON.stringify({ url, formats: ["markdown"] }),
+    })).json();
+
+    const content = fcData.data?.markdown || fcData.markdown || "";
+
+    const extraction = await claudeChat(
+      "Extrae productos de contenido web/redes sociales. SOLO JSON.",
+      `Extrae todos los productos que encuentres. JSON:
+{"productos":[{"nombre":"...","precio":"...","descripcion":"...","disponible":true}]}
+Contenido: ${content.slice(0, 3000)}`
+    );
+
+    let productos = [];
+    try {
+      const parsed = JSON.parse(extraction.replace(/```json|```/g, "").trim());
+      productos = parsed.productos || [];
+    } catch {}
+
+    const catalogoId = `cat_${Date.now()}`;
+    activaStore.catalogos[catalogoId] = {
+      id: catalogoId, nombre, productos, total_productos: productos.length,
+      fuente: url, created_at: new Date().toISOString(),
+    };
+
+    res.json({ ok: true, catalogo_id: catalogoId, productos, total: productos.length, fuente: url });
+  } catch (err) { next(err); }
+});
+
+// ══════════════════════════════════════════════════════════
+//  3. CAMPAÑAS
+// ══════════════════════════════════════════════════════════
+
+// POST /activa/campana/preview — previsualizar mensajes antes de enviar
+app.post("/activa/campana/preview", async (req, res, next) => {
+  try {
+    const {
+      base_id, catalogo_id, tipo = "catalogo",
+      template, segmento, limit = 5,
+      promocion, contexto_empresa = ""
+    } = req.body;
+
+    if (!base_id) return res.status(400).json({ error: "base_id requerido" });
+
+    const base = activaStore.bases[base_id];
+    if (!base) return res.status(404).json({ error: "Base no encontrada" });
+
+    let contactos = base.contactos;
+    if (segmento) contactos = contactos.filter(c => c.segmento === segmento);
+    const muestra = contactos.slice(0, limit);
+
+    const catalogo = catalogo_id ? activaStore.catalogos[catalogo_id] : null;
+
+    const previews = await Promise.all(muestra.map(async (contacto) => {
+      let mensaje;
+
+      if (template) {
+        // Template con variables
+        mensaje = template
+          .replace(/\{\{nombre\}\}/gi, contacto.nombre || "estimado cliente")
+          .replace(/\{\{empresa\}\}/gi, contacto.empresa || "")
+          .replace(/\{\{ciudad\}\}/gi, contacto.ciudad || "")
+          .replace(/\{\{segmento\}\}/gi, contacto.segmento || "");
+      } else if (tipo === "catalogo" && catalogo) {
+        const productos_texto = catalogo.productos.slice(0, 3)
+          .map(p => p.mensaje_wa || `• ${p.nombre} - $${p.precio}`).join('\n');
+        mensaje = await claudeChat(
+          "Ventas por WhatsApp LATAM. Mensaje personalizado, cálido, máx 200 chars con emoji.",
+          `Cliente: ${contacto.nombre} | Empresa: ${contacto.empresa} | Ciudad: ${contacto.ciudad}
+Catálogo: ${catalogo.nombre}
+Productos destacados:\n${productos_texto}
+Contexto: ${contexto_empresa}
+Genera el mensaje personalizado para este cliente.`
+        );
+      } else if (tipo === "promocion" && promocion) {
+        mensaje = await claudeChat(
+          "Ventas por WhatsApp LATAM. Mensaje de promoción personalizado, máx 160 chars, con urgencia.",
+          `Cliente: ${contacto.nombre} | Empresa: ${contacto.empresa}
+Promoción: ${promocion}
+Contexto: ${contexto_empresa}
+Genera el mensaje.`
+        );
+      } else {
+        mensaje = `Hola ${contacto.nombre}, tenemos novedades para ti. ¿Te interesa conocerlas?`;
+      }
+
+      return { contacto: { nombre: contacto.nombre, telefono: contacto.telefono, empresa: contacto.empresa }, mensaje: mensaje.trim() };
+    }));
+
+    res.json({
+      ok: true, tipo, base_id, total_en_base: contactos.length,
+      segmento: segmento || "todos", previews,
+      estimado_envio: contactos.filter(c => c.telefono).length,
+    });
+  } catch (err) { next(err); }
+});
+
+// POST /activa/campana/send — enviar campaña
+app.post("/activa/campana/send", async (req, res, next) => {
+  try {
+    const {
+      base_id, catalogo_id, tipo = "catalogo",
+      template, segmento, limite_envios = 50,
+      promocion, contexto_empresa = "",
+      delay_ms = 1500, // delay entre mensajes para evitar spam
+    } = req.body;
+
+    if (!base_id) return res.status(400).json({ error: "base_id requerido" });
+
+    const base = activaStore.bases[base_id];
+    if (!base) return res.status(404).json({ error: "Base no encontrada" });
+
+    let contactos = base.contactos.filter(c => c.telefono);
+    if (segmento) contactos = contactos.filter(c => c.segmento === segmento);
+    contactos = contactos.slice(0, limite_envios);
+
+    if (!contactos.length) return res.status(400).json({ error: "No hay contactos con teléfono en esta base/segmento" });
+
+    const campanaId = `camp_${Date.now()}`;
+    const catalogo = catalogo_id ? activaStore.catalogos[catalogo_id] : null;
+
+    // Enviar en background
+    const resultados = [];
+    let enviados = 0, fallidos = 0;
+
+    // Respuesta inmediata con el ID de campaña
+    res.json({
+      ok: true, campana_id: campanaId,
+      total_a_enviar: contactos.length,
+      status: "sending",
+      message: `Campaña iniciada. Enviando ${contactos.length} mensajes con delay de ${delay_ms}ms entre cada uno.`,
+    });
+
+    // Proceso de envío en background
+    (async () => {
+      for (const contacto of contactos) {
+        try {
+          let mensaje;
+
+          if (template) {
+            mensaje = template
+              .replace(/\{\{nombre\}\}/gi, contacto.nombre || "estimado cliente")
+              .replace(/\{\{empresa\}\}/gi, contacto.empresa || "")
+              .replace(/\{\{ciudad\}\}/gi, contacto.ciudad || "")
+              .replace(/\{\{segmento\}\}/gi, contacto.segmento || "");
+          } else if (tipo === "catalogo" && catalogo) {
+            const productos_texto = catalogo.productos.slice(0, 3)
+              .map(p => p.mensaje_wa || `• ${p.nombre} - $${p.precio}`).join('\n');
+            mensaje = await claudeChat(
+              "Ventas WhatsApp. Mensaje corto personalizado máx 200 chars.",
+              `Cliente: ${contacto.nombre} | Catálogo: ${catalogo.nombre}\nProductos: ${productos_texto}\nContexto: ${contexto_empresa}\nGenera mensaje.`
+            );
+          } else if (tipo === "promocion") {
+            mensaje = await claudeChat(
+              "Ventas WhatsApp. Mensaje de promoción personalizado máx 160 chars.",
+              `Cliente: ${contacto.nombre} | Empresa: ${contacto.empresa}\nPromoción: ${promocion}\nGenera mensaje.`
+            );
+          } else {
+            mensaje = `Hola ${contacto.nombre || ""}! Tenemos novedades. ¿Te cuento? 🚀`;
+          }
+
+          // Enviar WhatsApp
+          const data = await sendWhatsApp(contacto.telefono, mensaje.trim());
+          const ok = !data.error_code;
+
+          resultados.push({ telefono: contacto.telefono, nombre: contacto.nombre, ok, sid: data.sid, mensaje: mensaje.trim() });
+          if (ok) enviados++; else fallidos++;
+
+          // Guardar en memoria
+          if (db && memoryMode === "postgresql" && contacto.telefono) {
+            await db.query(`
+              INSERT INTO memory (entity_id, entity_type, data)
+              VALUES ($1, 'activa_contact', $2)
+              ON CONFLICT (entity_id) DO UPDATE SET data = memory.data || $2, updated_at = NOW()
+            `, [contacto.telefono, {
+              nombre: contacto.nombre, last_campana: campanaId,
+              last_mensaje_enviado: mensaje.trim(), last_contact: new Date().toISOString(),
+            }]).catch(() => {});
+          }
+
+          await new Promise(r => setTimeout(r, delay_ms));
+        } catch (e) {
+          resultados.push({ telefono: contacto.telefono, nombre: contacto.nombre, ok: false, error: e.message });
+          fallidos++;
+        }
+      }
+
+      activaStore.campanas[campanaId] = {
+        id: campanaId, base_id, tipo, enviados, fallidos,
+        total: contactos.length, resultados,
+        completed_at: new Date().toISOString(),
+      };
+
+      console.log(`[CAMPAÑA ${campanaId}] Completada: ${enviados} enviados, ${fallidos} fallidos`);
+    })();
+
+  } catch (err) { next(err); }
+});
+
+// GET /activa/campana/:id — resultado de una campaña
+app.get("/activa/campana/:id", (req, res) => {
+  const campana = activaStore.campanas[req.params.id];
+  if (!campana) return res.json({ status: "sending", message: "Campaña en proceso..." });
+  res.json({ status: "completed", ...campana });
+});
+
+// GET /activa/campana — listar campañas
+app.get("/activa/campana", (_req, res) => {
+  const campanas = Object.values(activaStore.campanas).map(c => ({
+    id: c.id, base_id: c.base_id, tipo: c.tipo,
+    enviados: c.enviados, fallidos: c.fallidos,
+    total: c.total, completed_at: c.completed_at,
+  }));
+  res.json({ campanas, total: campanas.length });
+});
+
+// ══════════════════════════════════════════════════════════
+//  4. CLIENTES INACTIVOS
+// ══════════════════════════════════════════════════════════
+
+// GET /activa/inactivos — detectar clientes sin contacto reciente
+app.get("/activa/inactivos", async (req, res, next) => {
+  try {
+    const { dias = 14 } = req.query;
+
+    if (db && memoryMode === "postgresql") {
+      const result = await db.query(`
+        SELECT entity_id, data, updated_at
+        FROM memory
+        WHERE entity_type IN ('contact', 'activa_contact')
+          AND updated_at < NOW() - INTERVAL '${parseInt(dias)} days'
+        ORDER BY updated_at ASC
+        LIMIT 50
+      `);
+      return res.json({
+        inactivos: result.rows.map(r => ({
+          id: r.entity_id,
+          nombre: r.data?.nombre,
+          telefono: r.data?.telefono || r.entity_id,
+          empresa: r.data?.empresa,
+          ultimo_contacto: r.updated_at,
+          dias_inactivo: Math.floor((Date.now() - new Date(r.updated_at)) / 86400000),
+        })),
+        total: result.rowCount,
+        dias_umbral: parseInt(dias),
+      });
+    }
+
+    res.json({ inactivos: [], total: 0, dias_umbral: parseInt(dias), mode: "in-memory" });
+  } catch (err) { next(err); }
+});
+
+// POST /activa/inactivos/reactivar — enviar campaña de reactivación
+app.post("/activa/inactivos/reactivar", async (req, res, next) => {
+  try {
+    const { dias = 14, mensaje_template, limite = 20, contexto_empresa = "" } = req.body;
+
+    if (!db || memoryMode !== "postgresql") {
+      return res.status(400).json({ error: "Requiere PostgreSQL activo" });
+    }
+
+    const result = await db.query(`
+      SELECT entity_id, data FROM memory
+      WHERE entity_type IN ('contact', 'activa_contact')
+        AND updated_at < NOW() - INTERVAL '${parseInt(dias)} days'
+        AND (data->>'reactivacion_enviada') IS DISTINCT FROM 'true'
+      LIMIT $1
+    `, [limite]);
+
+    if (!result.rows.length) {
+      return res.json({ ok: true, message: "No hay clientes inactivos para reactivar", enviados: 0 });
+    }
+
+    const resultados = [];
+    res.json({ ok: true, total: result.rows.length, status: "sending", message: `Reactivando ${result.rows.length} clientes...` });
+
+    (async () => {
+      for (const row of result.rows) {
+        const contacto = row.data || {};
+        const telefono = contacto.telefono || row.entity_id;
+        if (!telefono || telefono.startsWith('base_')) continue;
+
+        try {
+          const mensaje = mensaje_template
+            ? mensaje_template.replace(/\{\{nombre\}\}/gi, contacto.nombre || "estimado cliente")
+            : await claudeChat(
+                "Ventas WhatsApp. Mensaje de reactivación cálido, sin ser invasivo. Máx 140 chars.",
+                `Cliente: ${contacto.nombre || "cliente"} | Empresa: ${contacto.empresa || ""}
+Lleva ${Math.floor((Date.now() - new Date(row.updated_at))/86400000)} días sin contacto.
+Contexto: ${contexto_empresa}
+Genera mensaje de reactivación.`
+              );
+
+          await sendWhatsApp(telefono, mensaje.trim());
+          await db.query(
+            `UPDATE memory SET data = data || '{"reactivacion_enviada":"true","reactivacion_fecha":"${new Date().toISOString()}"}', updated_at = NOW() WHERE entity_id = $1`,
+            [row.entity_id]
+          ).catch(() => {});
+
+          resultados.push({ id: row.entity_id, nombre: contacto.nombre, ok: true });
+          await new Promise(r => setTimeout(r, 1500));
+        } catch (e) {
+          resultados.push({ id: row.entity_id, nombre: contacto.nombre, ok: false, error: e.message });
+        }
+      }
+      console.log(`[REACTIVACIÓN] ${resultados.filter(r=>r.ok).length}/${resultados.length} enviados`);
+    })();
+
+  } catch (err) { next(err); }
+});
+
+// ══════════════════════════════════════════════════════════
+//  5. SEGMENTACIÓN IA
+// ══════════════════════════════════════════════════════════
+
+// POST /activa/segmentar — Claude segmenta una base automáticamente
+app.post("/activa/segmentar", async (req, res, next) => {
+  try {
+    const { base_id, criterios = "" } = req.body;
+    if (!base_id) return res.status(400).json({ error: "base_id requerido" });
+
+    const base = activaStore.bases[base_id];
+    if (!base) return res.status(404).json({ error: "Base no encontrada" });
+
+    const muestra = base.contactos.slice(0, 30);
+
+    const segmentacion = await claudeChat(
+      "Analista de datos comerciales. Segmenta contactos para campañas. SOLO JSON.",
+      `Analiza estos ${base.total} contactos y propón segmentos para campañas.
+Muestra: ${JSON.stringify(muestra)}
+Criterios adicionales: ${criterios}
+
+JSON: {"segmentos":[{"nombre":"...","descripcion":"...","criterio":"...","tamaño_estimado":0,"prioridad":"alta|media|baja","mensaje_recomendado":"..."}]}`,
+      "claude-sonnet-4-20250514", 800
+    );
+
+    let segmentos = [];
+    try {
+      const parsed = JSON.parse(segmentacion.replace(/```json|```/g, "").trim());
+      segmentos = parsed.segmentos || [];
+    } catch {}
+
+    res.json({ ok: true, base_id, total_contactos: base.total, segmentos });
+  } catch (err) { next(err); }
+});
+
+
 // ═══════════════════════════════════════════════════════════
 //  PrismDB — Audit Layer
 //  Registro completo de cada decisión de la infraestructura
@@ -2656,6 +2684,8 @@ app.get("/audit/export", async (req, res, next) => {
     res.send(csv);
   } catch (err) { next(err); }
 });
+
+
 // ═══════════════════════════════════════════════════════════
 //  PrismDB — pgvector / Memoria Semántica
 //  Embeddings con Gemini text-embedding-004
@@ -2679,7 +2709,7 @@ async function initVectorTables() {
       entity_type TEXT,
       content     TEXT NOT NULL,
       summary     TEXT,
-      embedding   vector(512),
+      embedding   vector(768),
       metadata    JSONB DEFAULT '{}',
       agent       TEXT,
       created_at  TIMESTAMPTZ DEFAULT NOW()
@@ -2700,7 +2730,7 @@ async function initVectorTables() {
       id          SERIAL PRIMARY KEY,
       pattern     TEXT NOT NULL,
       description TEXT,
-      embedding   vector(512),
+      embedding   vector(768),
       examples    JSONB DEFAULT '[]',
       confidence  NUMERIC DEFAULT 0,
       agent       TEXT,
@@ -2717,20 +2747,21 @@ setTimeout(initVectorTables, 5000);
 // ══════════════════════════════════════════════════════════
 async function generateEmbedding(text) {
   try {
-    const voyageKey = process.env.VOYAGE_API_KEY;
-    if (!voyageKey) { console.error("[EMBEDDING] VOYAGE_API_KEY no configurada"); return null; }
-    const res = await fetch("https://api.voyageai.com/v1/embeddings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${voyageKey}` },
-      body: JSON.stringify({
-        model: "voyage-3-lite",
-        input: text.slice(0, 4000),
-        input_type: "document"
-      })
-    });
+    const geminiKey = process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY;
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${geminiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "models/text-embedding-004",
+          content: { parts: [{ text: text.slice(0, 2000) }] },
+          taskType: "SEMANTIC_SIMILARITY"
+        })
+      }
+    );
     const data = await res.json();
-    if (data.error) { console.error("[EMBEDDING ERROR]", data.error); return null; }
-    return data.data?.[0]?.embedding || null;
+    return data.embedding?.values || null;
   } catch (e) {
     console.error("[EMBEDDING ERROR]", e.message);
     return null;
@@ -2818,7 +2849,7 @@ async function semanticSearch(query, options = {}) {
 // ══════════════════════════════════════════════════════════
 
 // POST /memory/embed — guardar texto en memoria semántica
-app.post("/semantic/embed", async (req, res, next) => {
+app.post("/memory/embed", async (req, res, next) => {
   try {
     const { entity_id, entity_type = "contact", content, metadata = {}, agent = "system" } = req.body;
     if (!entity_id || !content) return res.status(400).json({ error: "entity_id y content requeridos" });
@@ -2831,7 +2862,7 @@ app.post("/semantic/embed", async (req, res, next) => {
 });
 
 // POST /memory/search — búsqueda semántica
-app.post("/semantic/search", async (req, res, next) => {
+app.post("/memory/search", async (req, res, next) => {
   try {
     const { query, limit = 5, threshold = 0.6, entity_type, agent } = req.body;
     if (!query) return res.status(400).json({ error: "query requerido" });
@@ -2872,7 +2903,7 @@ Responde directamente sin preámbulo.` }] }],
 });
 
 // POST /memory/similar — encontrar entidades similares a una dada
-app.post("/semantic/similar", async (req, res, next) => {
+app.post("/memory/similar", async (req, res, next) => {
   try {
     const { entity_id, limit = 5 } = req.body;
     if (!entity_id) return res.status(400).json({ error: "entity_id requerido" });
@@ -2908,7 +2939,7 @@ app.post("/semantic/similar", async (req, res, next) => {
 });
 
 // POST /memory/patterns — detectar patrones entre entidades
-app.post("/semantic/patterns", async (req, res, next) => {
+app.post("/memory/patterns", async (req, res, next) => {
   try {
     const { context = "ventas", limit = 10 } = req.body;
     if (!db || memoryMode !== "postgresql") return res.json({ patterns: [] });
@@ -2949,7 +2980,7 @@ Responde SOLO JSON:
 });
 
 // GET /memory/stats/vector — estadísticas de la memoria semántica
-app.get("/semantic/stats", async (_req, res, next) => {
+app.get("/memory/stats/vector", async (_req, res, next) => {
   try {
     if (!db || memoryMode !== "postgresql") return res.json({ stats: {}, mode: "in-memory" });
 
@@ -2973,3 +3004,16 @@ app.get("/semantic/stats", async (_req, res, next) => {
 globalThis.saveKnowledge = saveKnowledge;
 globalThis.semanticSearch = semanticSearch;
 globalThis.generateEmbedding = generateEmbedding;
+
+
+// ── Error handler ─────────────────────────────────────────
+app.use((err, _req, res, _next) => {
+  console.error("[ERROR]", err.message);
+  res.status(500).json({ error: err.message || "Error interno" });
+});
+
+app.listen(PORT, () => {
+  console.log(`✅ PrismDB v2.1 corriendo en http://localhost:${PORT}`);
+  console.log(`   Memory: ${memoryMode} | AI Router activo | Event Bus iniciando...`);
+  console.log(`   Módulos: SDR · Revenue · Ventas Activas · Talent · Finance · Enterprise Graph`);
+});
