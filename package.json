@@ -1,19 +1,24 @@
 {
   "name": "prismdb-backend",
-  "version": "2.0.0",
-  "description": "PrismDB — WhatsApp Revenue OS con Memory Layer + Agentes IA",
-  "type": "module",
+  "version": "2.1.0",
+  "description": "PrismDB — Autonomous Enterprise Operating System Backend",
   "main": "prismdb-backend.js",
+  "type": "module",
   "scripts": {
     "start": "node prismdb-backend.js",
-    "dev":   "node --watch prismdb-backend.js"
+    "dev": "nodemon prismdb-backend.js"
   },
-  "engines": { "node": ">=20.0.0" },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
-    "express": "^4.19.2",
-    "cors":    "^2.8.5",
-    "helmet":  "^7.1.0",
-    "dotenv":  "^16.4.5",
-    "pg":      "^8.11.0"
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "pg": "^8.11.3",
+    "@google/generative-ai": "^0.21.0",
+    "twilio": "^4.19.0",
+    "axios": "^1.6.2",
+    "dotenv": "^16.3.1",
+    "helmet": "^7.1.0"
   }
 }
