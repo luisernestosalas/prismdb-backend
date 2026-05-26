@@ -164,13 +164,21 @@ app.post("/memory/:entityId", async (req, res, next) => {
 // ══════════════════════════════════════════════════════════
 //  EVENTS
 // ══════════════════════════════════════════════════════════
-app.get("/events", async (_req, res, next) => {
+app.get("/events", async (req, res, next) => {
   try {
+    const { type, limit = 50 } = req.query;
     if (db && memoryMode === "postgresql") {
-      const result = await db.query("SELECT * FROM events ORDER BY created_at DESC LIMIT 100");
+      const query = type
+        ? `SELECT * FROM events WHERE event_type = $1 ORDER BY created_at DESC LIMIT $2`
+        : `SELECT * FROM events ORDER BY created_at DESC LIMIT $1`;
+      const params = type ? [type, parseInt(limit)] : [parseInt(limit)];
+      const result = await db.query(query, params);
       return res.json({ events: result.rows });
     }
-    res.json({ events: eventsStore.slice(-100).reverse() });
+    // In-memory fallback with type filter
+    let events = eventsStore.slice(-200).reverse();
+    if (type) events = events.filter(e => e.type === type || e.event_type === type);
+    res.json({ events: events.slice(0, parseInt(limit)) });
   } catch (err) { next(err); }
 });
 
@@ -587,6 +595,176 @@ Devuelve SOLO el mensaje a enviar, sin JSON.`
       console.error("[WEBHOOK BACKGROUND ERROR]", e.message);
     }
   })();
+});
+
+
+// ══════════════════════════════════════════════════════════
+//  AUTONOMOUS LOOP — El sistema prospecca y envía solo
+// ══════════════════════════════════════════════════════════
+
+let autonomousLoopActive = false;
+let autonomousLoopTimer = null;
+let autonomousStats = { runs: 0, sent: 0, moved: 0, lastRun: null, errors: 0 };
+
+// POST /autonomous/start — activar loop autónomo
+app.post("/autonomous/start", async (req, res) => {
+  const {
+    query = "empresas medianas",
+    cargo = "Gerente Comercial",
+    ciudad = "Bogotá",
+    interval_minutes = 60,
+    max_per_run = 5,
+    tone = "consultivo",
+    business_context = "PrismDB automatiza ventas desde $599/mes",
+  } = req.body;
+
+  if (autonomousLoopActive) {
+    return res.json({ ok: true, message: "Loop ya activo", stats: autonomousStats });
+  }
+
+  autonomousLoopActive = true;
+  console.log(`[AUTONOMOUS] Loop iniciado — ${query} · ${ciudad} · cada ${interval_minutes} min`);
+
+  const runCycle = async () => {
+    if (!autonomousLoopActive) return;
+    autonomousStats.runs++;
+    autonomousStats.lastRun = new Date().toISOString();
+    console.log(`[AUTONOMOUS] Ciclo #${autonomousStats.runs}`);
+
+    try {
+      // 1. Buscar prospectos con Firecrawl
+      let prospects = [];
+      if (process.env.FIRECRAWL_API_KEY) {
+        try {
+          const searchQuery = `${cargo} ${query} ${ciudad} WhatsApp contacto`;
+          const fcRes = await fetch("https://api.firecrawl.dev/v1/search", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.FIRECRAWL_API_KEY}` },
+            body: JSON.stringify({ query: searchQuery, limit: max_per_run * 2 }),
+          });
+          const fcData = await fcRes.json();
+          const raw = (fcData.data || []).slice(0, max_per_run * 2);
+
+          // 2. Claude analiza y puntúa cada prospecto
+          if (raw.length > 0) {
+            const analysis = await claudeChat(
+              `Analiza estos resultados de búsqueda web y extrae prospectos B2B reales para "${query}" en ${ciudad}.
+Para cada uno devuelve SOLO JSON array:
+[{"nombre":"...","cargo":"...","empresa":"...","ciudad":"${ciudad}","score":85,"razon":"señal detectada","telefono":null}]
+Si no hay suficiente info, omite ese resultado. Score 0-100 según señales de compra.`,
+              `Resultados:
+${raw.map(r => `- ${r.title}: ${r.description} (${r.url})`).join("
+")}`
+            );
+            try {
+              const parsed = JSON.parse(analysis.replace(/```json|```/g, "").trim());
+              prospects = Array.isArray(parsed) ? parsed : [];
+            } catch { prospects = []; }
+          }
+        } catch(e) {
+          console.error("[AUTONOMOUS] Firecrawl error:", e.message);
+        }
+      }
+
+      // Fallback: generate synthetic prospects if no API key or no results
+      if (prospects.length === 0) {
+        console.log("[AUTONOMOUS] Using synthetic prospects (no Firecrawl key or no results)");
+        prospects = [{
+          nombre: `Prospecto Auto ${Date.now()}`,
+          cargo, empresa: `${query} Express`, ciudad,
+          score: 75, razon: "Generado por loop autónomo (modo demo)",
+          telefono: null,
+        }];
+      }
+
+      // 3. Para cada prospecto: generar mensaje y enviar
+      for (const prospect of prospects.slice(0, max_per_run)) {
+        try {
+          // Generate personalized message with Claude
+          const msgPrompt = `Genera un mensaje de prospección por WhatsApp (máx 180 chars, con emoji) para:
+Nombre: ${prospect.nombre}, Cargo: ${prospect.cargo}, Empresa: ${prospect.empresa}
+Señal: ${prospect.razon}
+Tono: ${tone}
+Contexto del remitente: ${business_context}
+Termina con pregunta de 1 respuesta fácil. Devuelve SOLO el mensaje.`;
+
+          const message = await claudeChat("Eres un SDR experto en ventas B2B en LATAM.", msgPrompt);
+
+          // Send via WhatsApp if phone number available
+          if (prospect.telefono && prospect.telefono.match(/\d{10}/)) {
+            await sendWhatsApp(`whatsapp:+57${prospect.telefono.replace(/\D/g,"")}`, message.trim());
+            autonomousStats.sent++;
+            console.log(`[AUTONOMOUS] Sent to ${prospect.nombre} (${prospect.telefono})`);
+          } else {
+            // No phone — log as pending in event bus
+            console.log(`[AUTONOMOUS] No phone for ${prospect.nombre} — logged to event bus`);
+          }
+
+          // Save to memory and pipeline
+          const entityId = prospect.empresa.replace(/\s+/g, "_").toLowerCase();
+          const memData = {
+            nombre: prospect.nombre, cargo: prospect.cargo,
+            empresa: prospect.empresa, ciudad: prospect.ciudad,
+            score: prospect.score, pipeline_stage: "contactado",
+            pipeline_updated_at: new Date().toISOString(),
+            last_message_sent: message.trim(),
+            autonomous: true,
+          };
+          if (db && memoryMode === "postgresql") {
+            await db.query(`
+              INSERT INTO memory (entity_id, entity_type, data)
+              VALUES ($1, 'prospect', $2)
+              ON CONFLICT (entity_id) DO UPDATE SET data = $2, updated_at = NOW()
+            `, [entityId, memData]).catch(()=>{});
+
+            await db.query(`
+              INSERT INTO pipeline (entity_id, entity_type, stage, revenue, probability)
+              VALUES ($1, 'prospect', 'contactado', 599, 15)
+              ON CONFLICT (entity_id) DO NOTHING
+            `, [entityId]).catch(()=>{});
+          } else {
+            memoryStore[entityId] = memData;
+            (crmPipeline["contactado"] ||= []).push({ entity_id: entityId, ...prospect, stage: "contactado" });
+          }
+
+          await logEvent("autonomous_prospect", entityId, {
+            prospect, message: message.trim(),
+            sent: !!prospect.telefono, cycle: autonomousStats.runs,
+          });
+
+          // Throttle — wait 3s between sends to avoid spam
+          await new Promise(r => setTimeout(r, 3000));
+        } catch(e) {
+          autonomousStats.errors++;
+          console.error(`[AUTONOMOUS] Error with prospect ${prospect.nombre}:`, e.message);
+        }
+      }
+    } catch(e) {
+      autonomousStats.errors++;
+      console.error("[AUTONOMOUS] Cycle error:", e.message);
+    }
+
+    // Schedule next run
+    if (autonomousLoopActive) {
+      autonomousLoopTimer = setTimeout(runCycle, interval_minutes * 60 * 1000);
+    }
+  };
+
+  // Run first cycle immediately
+  runCycle();
+  res.json({ ok: true, message: `Loop autónomo iniciado — ciclo cada ${interval_minutes} min`, stats: autonomousStats });
+});
+
+// POST /autonomous/stop
+app.post("/autonomous/stop", (req, res) => {
+  autonomousLoopActive = false;
+  if (autonomousLoopTimer) clearTimeout(autonomousLoopTimer);
+  res.json({ ok: true, message: "Loop autónomo detenido", stats: autonomousStats });
+});
+
+// GET /autonomous/status
+app.get("/autonomous/status", (req, res) => {
+  res.json({ active: autonomousLoopActive, stats: autonomousStats });
 });
 
 // ══════════════════════════════════════════════════════════
