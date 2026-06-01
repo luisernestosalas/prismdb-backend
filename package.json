@@ -1,24 +1,25 @@
 {
   "name": "prismdb-backend",
   "version": "2.1.0",
-  "description": "PrismDB — Autonomous Enterprise Operating System Backend",
-  "main": "prismdb-backend.js",
+  "description": "PrismDB — Autonomous Enterprise OS™ Backend",
   "type": "module",
+  "main": "prismdb-backend.js",
   "scripts": {
     "start": "node prismdb-backend.js",
-    "dev": "nodemon prismdb-backend.js"
+    "dev": "node --watch prismdb-backend.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "dependencies": {
-    "express": "^4.18.2",
+    "express": "^4.19.2",
     "cors": "^2.8.5",
+    "helmet": "^7.1.0",
+    "dotenv": "^16.4.5",
     "pg": "^8.11.3",
-    "@google/generative-ai": "^0.21.0",
+    "@google/generative-ai": "^0.2.1",
     "twilio": "^4.19.0",
     "axios": "^1.6.2",
-    "dotenv": "^16.3.1",
-    "helmet": "^7.1.0"
+    "node-fetch": "^3.3.2"
   }
 }
