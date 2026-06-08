@@ -1,263 +1,90 @@
-const express = require('express');
-const { createClient } = require('@supabase/supabase-js');
-const cors = require('cors');
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import dotenv from "dotenv";
+import pg from "pg";
+import { processEvent, startEventBus } from "./src/server/router.js";
+import { initAuditTable } from "./src/server/audit-layer.js";
+import { initGraphTables } from "./src/server/enterprise-graph.js";
+import { initVectorTables } from "./src/server/pgvector.js";
+import { setupVentasActivasRoutes } from "./src/server/ventas-activas.js";
+import { setupRRHHRoutes } from "./src/server/rrhh.js";
+import { setupAIProxyRoutes } from "./src/server/ai-proxy.js";   // ← NUEVO
+import { claudeChat, sendWhatsApp } from "./src/server/utils.js";
 
-const app = express();
-app.use(cors({ origin: '*' }));
-app.use(express.json());
+dotenv.config();
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+const app  = express();
+const PORT = parseInt(process.env.PORT || "3000", 10);
 
-// ─── HEALTH ──────────────────────────────────────────────
-app.get('/', (req, res) => res.json({ status: 'Prisma OS Backend v1.0', ok: true }));
+// ── Seguridad ────────────────────────────────────────────────
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+}));
 
-// ═══════════════════════════════════════════════════════════
-// VENTAS — PROSPECTOS / PIPELINE
-// ═══════════════════════════════════════════════════════════
+// Solo acepta peticiones del frontend — cambia en Railway por tu dominio real
+const ALLOWED_ORIGINS = (process.env.FRONTEND_URL || "*").split(",").map(s => s.trim());
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || ALLOWED_ORIGINS.includes("*") || ALLOWED_ORIGINS.includes(origin)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`CORS: origen no permitido — ${origin}`));
+    }
+  },
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "X-PrismIA-Client", "Authorization"],
+}));
 
-// GET todos los deals del pipeline
-app.get('/api/deals', async (req, res) => {
-  const { data, error } = await supabase
-    .from('deals')
-    .select('*')
-    .order('created_at', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
+app.use(express.json({ limit: "2mb" }));
 
-// GET un deal por ID
-app.get('/api/deals/:id', async (req, res) => {
-  const { data, error } = await supabase
-    .from('deals')
-    .select('*')
-    .eq('id', req.params.id)
-    .single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
+// ── Base de datos ────────────────────────────────────────────
+let db = null;
+let memoryMode = "in-memory";
 
-// POST crear nuevo prospecto/deal
-app.post('/api/deals', async (req, res) => {
-  const {
-    empresa, contacto, email, telefono, cargo,
-    valor_mensual, moneda, etapa, canal_origen,
-    notas, score_mvv, ciudad
-  } = req.body;
-
-  const { data, error } = await supabase
-    .from('deals')
-    .insert([{
-      empresa, contacto, email, telefono, cargo,
-      valor_mensual: valor_mensual || 0,
-      moneda: moneda || 'USD',
-      etapa: etapa || 'prospecto',
-      canal_origen: canal_origen || 'manual',
-      notas, score_mvv: score_mvv || 50,
-      ciudad,
-      probabilidad: calcProbabilidad(etapa || 'prospecto')
-    }])
-    .select()
-    .single();
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json(data);
-});
-
-// PATCH actualizar etapa / datos del deal
-app.patch('/api/deals/:id', async (req, res) => {
-  const updates = { ...req.body, updated_at: new Date().toISOString() };
-  if (updates.etapa) updates.probabilidad = calcProbabilidad(updates.etapa);
-
-  const { data, error } = await supabase
-    .from('deals')
-    .update(updates)
-    .eq('id', req.params.id)
-    .select()
-    .single();
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-// DELETE eliminar deal
-app.delete('/api/deals/:id', async (req, res) => {
-  const { error } = await supabase.from('deals').delete().eq('id', req.params.id);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true });
-});
-
-// GET métricas del pipeline (MRR, pipeline total, por etapa)
-app.get('/api/deals/metrics/summary', async (req, res) => {
-  const { data, error } = await supabase.from('deals').select('*');
-  if (error) return res.status(500).json({ error: error.message });
-
-  const clientes = data.filter(d => d.etapa === 'cliente');
-  const pipeline = data.filter(d => d.etapa !== 'cliente' && d.etapa !== 'perdido');
-
-  const mrr = clientes.reduce((s, d) => s + (d.valor_mensual || 0), 0);
-  const pipelineTotal = pipeline.reduce((s, d) => s + (d.valor_mensual || 0), 0);
-
-  const porEtapa = {};
-  data.forEach(d => {
-    porEtapa[d.etapa] = (porEtapa[d.etapa] || 0) + 1;
+if (process.env.DATABASE_URL) {
+  const { Pool } = pg;
+  db = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+    max: 5,
   });
 
-  res.json({ mrr, pipeline_total: pipelineTotal, total_deals: data.length, por_etapa: porEtapa, clientes: clientes.length });
-});
+  db.connect()
+    .then(async (client) => {
+      memoryMode = "postgresql";
+      await initAuditTable(db, memoryMode);
+      await initGraphTables(db, memoryMode);
+      await initVectorTables(db, memoryMode);
 
-// POST registrar actividad/nota en un deal
-app.post('/api/deals/:id/actividades', async (req, res) => {
-  const { tipo, descripcion, resultado } = req.body;
-  const { data, error } = await supabase
-    .from('actividades')
-    .insert([{ deal_id: req.params.id, tipo, descripcion, resultado }])
-    .select()
-    .single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json(data);
-});
+      // Rutas de negocio
+      setupVentasActivasRoutes(app, db, memoryMode, claudeChat, sendWhatsApp);
+      setupRRHHRoutes(app, db);
 
-// GET actividades de un deal
-app.get('/api/deals/:id/actividades', async (req, res) => {
-  const { data, error } = await supabase
-    .from('actividades')
-    .select('*')
-    .eq('deal_id', req.params.id)
-    .order('created_at', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-// ═══════════════════════════════════════════════════════════
-// CONTACTOS
-// ═══════════════════════════════════════════════════════════
-
-app.get('/api/contacts', async (req, res) => {
-  const { data, error } = await supabase
-    .from('contacts')
-    .select('*')
-    .order('created_at', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-app.post('/api/contacts', async (req, res) => {
-  const { data, error } = await supabase
-    .from('contacts')
-    .insert([req.body])
-    .select()
-    .single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json(data);
-});
-
-// ═══════════════════════════════════════════════════════════
-// RRHH — EQUIPO
-// ═══════════════════════════════════════════════════════════
-
-app.get('/api/equipo', async (req, res) => {
-  const { data, error } = await supabase
-    .from('equipo')
-    .select('*')
-    .order('nombre');
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-app.post('/api/equipo', async (req, res) => {
-  const { data, error } = await supabase
-    .from('equipo')
-    .insert([req.body])
-    .select()
-    .single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json(data);
-});
-
-app.patch('/api/equipo/:id', async (req, res) => {
-  const { data, error } = await supabase
-    .from('equipo')
-    .update({ ...req.body, updated_at: new Date().toISOString() })
-    .eq('id', req.params.id)
-    .select()
-    .single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-// ═══════════════════════════════════════════════════════════
-// TAREAS / ACCIONES REQUERIDAS
-// ═══════════════════════════════════════════════════════════
-
-app.get('/api/tareas', async (req, res) => {
-  const { data, error } = await supabase
-    .from('tareas')
-    .select('*')
-    .order('prioridad', { ascending: false })
-    .order('fecha_vence');
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-app.post('/api/tareas', async (req, res) => {
-  const { data, error } = await supabase
-    .from('tareas')
-    .insert([req.body])
-    .select()
-    .single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json(data);
-});
-
-app.patch('/api/tareas/:id', async (req, res) => {
-  const { data, error } = await supabase
-    .from('tareas')
-    .update(req.body)
-    .eq('id', req.params.id)
-    .select()
-    .single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-// ═══════════════════════════════════════════════════════════
-// ALERTAS
-// ═══════════════════════════════════════════════════════════
-
-app.get('/api/alertas', async (req, res) => {
-  const { data, error } = await supabase
-    .from('alertas')
-    .select('*')
-    .eq('activa', true)
-    .order('created_at', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-app.patch('/api/alertas/:id/resolver', async (req, res) => {
-  const { data, error } = await supabase
-    .from('alertas')
-    .update({ activa: false, resuelta_at: new Date().toISOString() })
-    .eq('id', req.params.id)
-    .select()
-    .single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-// ─── HELPER ──────────────────────────────────────────────
-function calcProbabilidad(etapa) {
-  const map = {
-    prospecto: 10, contactado: 25, calificado: 40,
-    propuesta: 60, negociacion: 75, cierre: 90,
-    cliente: 100, perdido: 0
-  };
-  return map[etapa] || 20;
+      client.release();
+      console.log("✅ PostgreSQL conectado");
+      startEventBus(db, 60000);
+    })
+    .catch((err) => {
+      console.error("⚠️ PostgreSQL error:", err.message);
+    });
 }
 
-// ─── START ────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Prisma OS Backend corriendo en puerto ${PORT}`));
+// ── AI Proxy — debe ir SIEMPRE, con o sin DB ─────────────────
+setupAIProxyRoutes(app, db);
+
+// ── Health check ─────────────────────────────────────────────
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, app: "prismia", version: "3.0", memory: memoryMode, ts: Date.now() })
+);
+
+// ── Error handler global ──────────────────────────────────────
+app.use((err, _req, res, _next) => {
+  console.error("[ERROR]", err.message);
+  res.status(err.status || 500).json({ error: err.message || "Error interno" });
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ PrismIA v3.0 corriendo en http://localhost:${PORT}`);
+  console.log(`🔒 AI Proxy activo — las keys nunca salen del servidor`);
+});
